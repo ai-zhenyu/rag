@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import re
 
+import chromadb
 import pdfplumber
 import tiktoken
 from dotenv import load_dotenv
@@ -187,6 +188,30 @@ def embed_chunks(chunks):
     return chunks
 
 
+def store_chunks(chunks):
+    """(Re)create the Chroma collection with cosine distance and add every chunk.
+
+    Chroma record shape: text -> documents, embedding -> embeddings,
+    n_tokens and page numbers -> metadatas.
+    """
+    client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
+    if config.COLLECTION_NAME in [c.name for c in client.list_collections()]:
+        client.delete_collection(config.COLLECTION_NAME)  # rebuild from scratch so re-runs don't duplicate
+    collection = client.create_collection(
+        name=config.COLLECTION_NAME,
+        configuration={"hnsw": {"space": "cosine"}},  # default would be "l2"
+    )
+    collection.add(
+        ids=[f"chunk-{i:04d}" for i in range(len(chunks))],
+        documents=[c["text"] for c in chunks],
+        embeddings=[c["embedding"] for c in chunks],
+        metadatas=[{"n_tokens": c["n_tokens"], "page_start": c["page_start"],
+                    "page_end": c["page_end"], "type": c["type"],
+                    "source": config.PDF_PATH.name} for c in chunks],
+    )
+    return collection
+
+
 def dump_pages(pages, tables, pdf_path):
     """Write extracted text and tables to data/extracted/<pdf name>.txt for inspection."""
     tables_by_page = defaultdict(list)
@@ -226,5 +251,7 @@ if __name__ == "__main__":
 
     print(f"Embedding with {config.EMBEDDING_MODEL}...")
     embed_chunks(chunks)
-    vec = chunks[0]["embedding"]
-    print(f"each embedding has {len(vec)} numbers; first 5 of chunk 0: {[round(x, 4) for x in vec[:5]]}")
+
+    collection = store_chunks(chunks)
+    print(f"Stored {collection.count()} chunks in {config.CHROMA_DIR} "
+          f"(collection '{collection.name}', distance: {collection.configuration['hnsw']['space']})")
