@@ -10,6 +10,8 @@ import re
 
 import pdfplumber
 import tiktoken
+from dotenv import load_dotenv
+from openai import OpenAI
 from unstructured.partition.pdf import partition_pdf
 
 import config
@@ -171,6 +173,20 @@ def chunk_tables(tables):
     return chunks
 
 
+def embed_chunks(chunks):
+    """Add an "embedding" (list of floats) to every chunk, sending chunks to OpenAI in batches."""
+    load_dotenv()  # reads OPENAI_API_KEY from .env; the OpenAI client picks it up automatically
+    client = OpenAI()
+    for i in range(0, len(chunks), config.EMBEDDING_BATCH_SIZE):
+        batch = chunks[i:i + config.EMBEDDING_BATCH_SIZE]
+        response = client.embeddings.create(model=config.EMBEDDING_MODEL,
+                                            input=[c["text"] for c in batch])
+        for chunk, item in zip(batch, response.data):
+            chunk["embedding"] = item.embedding
+        print(f"  embedded {i + len(batch)}/{len(chunks)} chunks")
+    return chunks
+
+
 def dump_pages(pages, tables, pdf_path):
     """Write extracted text and tables to data/extracted/<pdf name>.txt for inspection."""
     tables_by_page = defaultdict(list)
@@ -207,3 +223,8 @@ if __name__ == "__main__":
         print(f"{kind:>5} chunks: {len(sizes):>3} | tokens min={min(sizes)} avg={sum(sizes) // len(sizes)} "
               f"max={max(sizes)} | in {config.MIN_CHUNK_TOKENS}-{config.MAX_CHUNK_TOKENS}: {in_range}")
     print(f"total chunks: {len(chunks)}, total tokens: {sum(c['n_tokens'] for c in chunks):,}")
+
+    print(f"Embedding with {config.EMBEDDING_MODEL}...")
+    embed_chunks(chunks)
+    vec = chunks[0]["embedding"]
+    print(f"each embedding has {len(vec)} numbers; first 5 of chunk 0: {[round(x, 4) for x in vec[:5]]}")
