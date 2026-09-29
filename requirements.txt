@@ -1,0 +1,6 @@
+unstructured[pdf]==0.18.32
+tiktoken==0.14.0
+openai==3.19.2
+chromadb==1.5.9
+python-dotenv==1.2.3
+pdfplumber==0.11.10
