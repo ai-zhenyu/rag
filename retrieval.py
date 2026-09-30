@@ -30,10 +30,13 @@ def embed_question(question):
     return response.data[0].embedding
 
 
-def search(question, k=config.TOP_K):
-    """Return the k chunks nearest to the question, closest first.
+def search(question, k=config.TOP_K, threshold=config.SIMILARITY_THRESHOLD):
+    """Return up to k chunks most similar to the question, most similar first.
 
-    Each result: {"id", "text", "page_start", "page_end", "type", "n_tokens", "distance"}
+    Chunks whose similarity is below `threshold` are dropped, so fewer than k (even zero)
+    may come back. Pass threshold=None to get the raw top k.
+
+    Each result: {"id", "text", "page_start", "page_end", "type", "n_tokens", "distance", "similarity"}
     """
     results = get_collection().query(
         query_embeddings=[embed_question(question)],  # our OpenAI vector, not Chroma's built-in embedder
@@ -41,11 +44,16 @@ def search(question, k=config.TOP_K):
         include=["documents", "metadatas", "distances"],
     )
     # Chroma answers a list of queries at once; we sent one, so take element [0] of each field.
-    return [
-        {"id": id_, "text": doc, **meta, "distance": dist}
+    chunks = [
+        {"id": id_, "text": doc, **meta, "distance": dist,
+         # The collection uses space="cosine", where Chroma defines distance = 1 - cosine similarity.
+         "similarity": 1 - dist}
         for id_, doc, meta, dist in zip(results["ids"][0], results["documents"][0],
                                         results["metadatas"][0], results["distances"][0])
     ]
+    if threshold is not None:
+        chunks = [c for c in chunks if c["similarity"] >= threshold]
+    return chunks
 
 
 def format_pages(chunk):
@@ -59,7 +67,10 @@ if __name__ == "__main__":
     question = sys.argv[1] if len(sys.argv) > 1 else "What was NVIDIA's revenue for the quarter ended July 30, 2023?"
     k = int(sys.argv[2]) if len(sys.argv) > 2 else config.TOP_K
 
-    print(f"Question: {question}\nTop {k} chunks (cosine distance: lower = more similar)\n")
-    for rank, chunk in enumerate(search(question, k), start=1):
-        preview = " ".join(chunk["text"].split())[:160]
-        print(f"#{rank}  distance={chunk['distance']:.4f}  {format_pages(chunk):<9} {chunk['type']:<5}  {preview}")
+    print(f"Question: {question}\nTop {k} chunks, similarity = 1 - cosine distance "
+          f"(threshold {config.SIMILARITY_THRESHOLD})\n")
+    for rank, chunk in enumerate(search(question, k, threshold=None), start=1):
+        status = "kept   " if chunk["similarity"] >= config.SIMILARITY_THRESHOLD else "DROPPED"
+        preview = " ".join(chunk["text"].split())[:130]
+        print(f"#{rank} {status} similarity={chunk['similarity']:.4f} (distance={chunk['distance']:.4f})  "
+              f"{format_pages(chunk):<9} {chunk['type']:<5}  {preview}")

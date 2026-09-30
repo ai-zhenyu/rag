@@ -23,4 +23,8 @@ CHROMA_DIR = PROJECT_DIR / "chroma_db"
 COLLECTION_NAME = "pdf_chunks"
 
 # Retrieval
-TOP_K = 5  # chunks returned by search() when k isn't given
+TOP_K = 10  # chunks returned by search() when k isn't given; k=10 found answers that k=5 and k=8 missed
+# Chunks with cosine similarity below this are dropped. Chosen with calibrate.py: answer chunks
+# scored 0.49-0.72, off-topic/other-company questions at most 0.44. On-topic questions the document
+# can't answer score as high as real answers, so the answer prompt (not the threshold) handles those.
+SIMILARITY_THRESHOLD = 0.50
