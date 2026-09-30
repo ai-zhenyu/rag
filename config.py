@@ -15,6 +15,9 @@ MAX_CHUNK_TOKENS = 500
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_BATCH_SIZE = 100  # chunks sent per API request
 
+# Chat model: writes table descriptions during ingest, and answers questions in answer.py
+CHAT_MODEL = "gpt-4o-mini"
+
 # Vector database
 CHROMA_DIR = PROJECT_DIR / "chroma_db"
 COLLECTION_NAME = "pdf_chunks"

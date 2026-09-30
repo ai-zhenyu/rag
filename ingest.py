@@ -3,10 +3,10 @@
 Run:  python ingest.py
       python ingest.py --dump   # also save the extracted text to data/extracted/
 """
+import re
 import sys
 from collections import defaultdict
-
-import re
+from concurrent.futures import ThreadPoolExecutor
 
 import chromadb
 import pdfplumber
@@ -19,9 +19,17 @@ import config
 
 ENCODER = tiktoken.get_encoding(config.TOKEN_ENCODING)
 
-# How far above a table (in PDF points, 72 = 1 inch) to look for its column headers.
+# How far above a table (in PDF points, 72 = 1 inch) to look for its title and column headers.
 # Headers like "Three Months Ended / Jul 28, 2024" sit above the table's first ruling line.
-TABLE_HEADER_BAND = 60
+TABLE_HEADER_BAND = 80
+
+TABLE_DESCRIPTION_PROMPT = (
+    "Write a short search description of this table from a company's financial report. Start with the "
+    "table's specific topic, taken from its title or from the section label directly above the rows "
+    '(e.g. "Inventories", not a generic heading); ignore any unrelated sentences above the table. Then '
+    "give the reporting periods of the columns, and list EVERY row label so each one can be found by "
+    "search. Do not quote any numbers. Do not invent anything.\n\n{table}"
+)
 
 
 def extract_tables(pdf_path):
@@ -180,6 +188,35 @@ def chunk_tables(tables):
     return chunks
 
 
+def describe_tables(chunks):
+    """Add an LLM-written "description" to every table chunk (contextual enrichment).
+
+    A table is mostly numbers, so its raw embedding is a weak signal and search rarely finds
+    it. A description naming the statement, periods and every row label (but no numbers)
+    gives the embedding clear words to match. It is only used for the embedding; the
+    answering LLM reads the raw table, so an error in a description can't reach an answer.
+    """
+    load_dotenv()
+    client = OpenAI()
+    tables = [c for c in chunks if c["type"] == "table"]
+
+    def describe(chunk):
+        response = client.chat.completions.create(
+            model=config.CHAT_MODEL, temperature=0,
+            messages=[{"role": "user", "content": TABLE_DESCRIPTION_PROMPT.format(table=chunk["text"])}],
+        )
+        chunk["description"] = response.choices[0].message.content.strip()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:  # 8 requests at a time instead of one by one
+        list(pool.map(describe, tables))
+    return chunks
+
+
+def embedding_input(chunk):
+    """Text that gets embedded: the description (if any) followed by the chunk text."""
+    return f"{chunk['description']}\n\n{chunk['text']}" if "description" in chunk else chunk["text"]
+
+
 def embed_chunks(chunks):
     """Add an "embedding" (list of floats) to every chunk, sending chunks to OpenAI in batches."""
     load_dotenv()  # reads OPENAI_API_KEY from .env; the OpenAI client picks it up automatically
@@ -187,7 +224,7 @@ def embed_chunks(chunks):
     for i in range(0, len(chunks), config.EMBEDDING_BATCH_SIZE):
         batch = chunks[i:i + config.EMBEDDING_BATCH_SIZE]
         response = client.embeddings.create(model=config.EMBEDDING_MODEL,
-                                            input=[c["text"] for c in batch])
+                                            input=[embedding_input(c) for c in batch])
         for chunk, item in zip(batch, response.data):
             chunk["embedding"] = item.embedding
         print(f"  embedded {i + len(batch)}/{len(chunks)} chunks")
@@ -198,7 +235,7 @@ def store_chunks(chunks):
     """(Re)create the Chroma collection with cosine distance and add every chunk.
 
     Chroma record shape: text -> documents, embedding -> embeddings,
-    n_tokens and page numbers -> metadatas.
+    n_tokens, page numbers and (for tables) the search description -> metadatas.
     """
     client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
     if config.COLLECTION_NAME in [c.name for c in client.list_collections()]:
@@ -212,8 +249,9 @@ def store_chunks(chunks):
         documents=[c["text"] for c in chunks],
         embeddings=[c["embedding"] for c in chunks],
         metadatas=[{"n_tokens": c["n_tokens"], "page_start": c["page_start"],
-                    "page_end": c["page_end"], "type": c["type"],
-                    "source": config.PDF_PATH.name} for c in chunks],
+                    "page_end": c["page_end"], "type": c["type"], "source": config.PDF_PATH.name,
+                    **({"description": c["description"]} if "description" in c else {})}
+                   for c in chunks],
     )
     return collection
 
@@ -254,6 +292,9 @@ if __name__ == "__main__":
         print(f"{kind:>5} chunks: {len(sizes):>3} | tokens min={min(sizes)} avg={sum(sizes) // len(sizes)} "
               f"max={max(sizes)} | in {config.MIN_CHUNK_TOKENS}-{config.MAX_CHUNK_TOKENS}: {in_range}")
     print(f"total chunks: {len(chunks)}, total tokens: {sum(c['n_tokens'] for c in chunks):,}")
+
+    print(f"Describing {sum(c['type'] == 'table' for c in chunks)} table chunks with {config.CHAT_MODEL}...")
+    describe_tables(chunks)
 
     print(f"Embedding with {config.EMBEDDING_MODEL}...")
     embed_chunks(chunks)
