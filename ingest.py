@@ -36,9 +36,15 @@ def extract_tables(pdf_path):
     tables = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            for table in page.find_tables():
+            prev_bottom = 0
+            for table in sorted(page.find_tables(), key=lambda t: t.bbox[1]):
                 x0, top, x1, bottom = table.bbox
-                header = page.crop((0, max(0, top - TABLE_HEADER_BAND), page.width, top)).extract_text()
+                # Look for headers just above the table, but not above the previous table on the page.
+                header_top = max(prev_bottom, top - TABLE_HEADER_BAND)
+                # within_bbox keeps only characters fully inside the band; crop() would also pull in
+                # clipped characters from a line cut by the band edge and garble them ("FFoorr tthhee").
+                header = page.within_bbox((0, header_top, page.width, top)).extract_text()
+                prev_bottom = bottom
                 rows = [_clean_row(row) for row in table.extract()]
                 rows = [" | ".join(cells) for cells in rows if cells]
                 if rows:
