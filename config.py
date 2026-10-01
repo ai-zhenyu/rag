@@ -28,3 +28,12 @@ TOP_K = 10  # chunks returned by search() when k isn't given; k=10 found answers
 # scored 0.49-0.72, off-topic/other-company questions at most 0.44. On-topic questions the document
 # can't answer score as high as real answers, so the answer prompt (not the threshold) handles those.
 SIMILARITY_THRESHOLD = 0.50
+
+# Hybrid search (version 2): the top chunks from vector search and from BM25 keyword search are combined.
+HYBRID_VECTOR_K = 5   # best chunks taken from vector search
+HYBRID_KEYWORD_K = 5  # best chunks taken from keyword search
+# A chunk is kept if its similarity reaches SIMILARITY_THRESHOLD or its BM25 score reaches this.
+# Chosen with calibrate.py: at 7 every calibration answer chunk is kept (the weakest scored 7.6) and
+# no unanswerable question gets through that vector search didn't already let through (off-topic
+# noise reached 6.7). The margin is thin, so re-run calibrate.py after changing chunking or the PDF.
+KEYWORD_SCORE_THRESHOLD = 7.0

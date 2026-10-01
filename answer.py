@@ -7,7 +7,7 @@ import sys
 from openai import OpenAI
 
 import config
-from retrieval import format_pages, search
+from retrieval import format_pages, hybrid_search
 
 NOT_FOUND = "The document doesn't contain the answer to this question."
 
@@ -39,11 +39,11 @@ def answer(question, chunks=None):
     """Answer the question from the document only, citing page numbers.
 
     `chunks` can be passed in when they were already retrieved (evaluate.py does this to
-    print them); otherwise search() is called. If no chunk passes the similarity threshold,
+    print them); otherwise hybrid_search() is called. If no chunk passes the thresholds,
     the model isn't called at all.
     """
     if chunks is None:
-        chunks = search(question)
+        chunks = hybrid_search(question)
     if not chunks:
         return NOT_FOUND
 
