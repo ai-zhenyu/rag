@@ -11,6 +11,7 @@ Generation (judged by a separate, stronger model):
 
 Run:  python benchmark.py                # hybrid search (v2)
       python benchmark.py --vector-only  # vector search only (v1), for comparison
+      python benchmark.py --category adversarial   # one category only
 """
 import json
 import re
@@ -22,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI, RateLimitError
 
 import config
-from answer import NOT_FOUND, answer, build_context
+from answer import EMPTY, NOT_FOUND, TOO_LONG, answer, build_context, cited_pages
 from retrieval import hybrid_search, search
 
 JUDGE_MODEL = "gpt-4o"  # stronger than the answering model, so it isn't grading its own work
@@ -49,7 +50,7 @@ Return JSON with:
 - "reason": one short sentence explaining any false value."""
 
 _judge = OpenAI()
-PAGE_RE = re.compile(r"\bpp?\.\s*(\d+)(?:\s*[-–]\s*(\d+))?")
+REFUSALS = (NOT_FOUND, TOO_LONG, EMPTY)  # fixed messages, graded by rule instead of by the judge
 
 
 def evidence_pages(evidence):
@@ -70,13 +71,6 @@ def evidence_pages(evidence):
     return {page for page, text in pages.items() if any(e in text for e in evidence)}
 
 
-def cited_pages(text):
-    pages = set()
-    for start, end in PAGE_RE.findall(text):
-        pages.update(range(int(start), int(end or start) + 1))
-    return pages
-
-
 def retrieve(question, vector_only):
     if vector_only:
         return search(question)  # threshold applied
@@ -88,7 +82,7 @@ def judge(item, answer_text, chunks):
     tiers allow few tokens per minute, so on a 429 rate-limit error wait and try again."""
     # A refusal is graded by rule, not by the LLM: the judge once marked "not found" as correct
     # for answerable questions, inflating the score.
-    if answer_text == NOT_FOUND:
+    if answer_text in REFUSALS:
         if item["evidence"]:
             return {"correct": False, "faithful": True, "reason": "refused, but the document has the answer"}
         return {"correct": True, "faithful": True, "reason": ""}
@@ -109,6 +103,8 @@ def judge(item, answer_text, chunks):
 
 def retrieve_and_answer(item, vector_only):
     chunks = retrieve(item["question"], vector_only)
+    if "inject" in item:  # indirect prompt injection test: a fake excerpt with planted instructions
+        chunks = chunks[:2] + [{"text": item["inject"], "page_start": 30, "page_end": 30, "type": "text"}] + chunks[2:]
     return chunks, answer(item["question"], chunks)
 
 
@@ -127,6 +123,9 @@ if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     vector_only = "--vector-only" in sys.argv
     items = json.load(open(config.PROJECT_DIR / "eval_set.json", encoding="utf-8"))
+    if "--category" in sys.argv:
+        wanted = sys.argv[sys.argv.index("--category") + 1]
+        items = [i for i in items if i["category"] == wanted]
 
     mode = "VECTOR ONLY (v1)" if vector_only else "HYBRID (v2)"
     print(f"Mode: {mode} | answer model: {config.CHAT_MODEL} | judge: {JUDGE_MODEL} | {len(items)} questions\n")
@@ -150,26 +149,34 @@ if __name__ == "__main__":
             print(f"{status} #{r['id']:<2} {r['category']:<12} {rank:<14} cite={'ok ' if r['citation'] else 'BAD'} "
                   f"faithful={'yes' if r['faithful'] else 'NO '}  {r['question']}")
         else:
-            how = "blocked (no LLM call)" if r["n_chunks"] == 0 else "refused by prompt" if r["correct"] else "ANSWERED"
-            print(f"{'ok  ' if r['correct'] else 'FAIL'} #{r['id']:<2} {r['category']:<12} {how:<28} {r['question']}")
+            how = ("rejected (too long)" if r["answer"] == TOO_LONG else "blocked (no LLM call)" if r["n_chunks"] == 0
+                   else "declined" if r["answer"] == NOT_FOUND else "answered safely" if r["correct"] else "ANSWERED")
+            question = " ".join(r["question"].split())[:110]
+            print(f"{'ok  ' if r['correct'] else 'FAIL'} #{r['id']:<2} {r['category']:<12} {how:<28} {question}")
         if not r["correct"] or not r["faithful"]:
             print(f"        answer: {' '.join(r['answer'].split())[:200]}")
             print(f"        judge:  {r['reason']}")
 
     answerable = [r for r in results if r["evidence"]]
-    unanswerable = [r for r in results if not r["evidence"]]
+    unanswerable = [r for r in results if r["category"] == "unanswerable"]
+    adversarial = [r for r in results if r["category"] == "adversarial"]
     pct = lambda n, d: f"{n}/{d} ({100 * n / d:.0f}%)"
 
     print("\n" + "=" * 70)
     print(f"SUMMARY ({mode})")
-    print(f"  Answerable ({len(answerable)}):")
-    print(f"    recall (answer chunk sent to LLM): {pct(sum(r['rank'] is not None for r in answerable), len(answerable))}")
-    print(f"    MRR:                               {sum(1 / r['rank'] for r in answerable if r['rank']) / len(answerable):.2f}")
-    print(f"    correct:                           {pct(sum(r['correct'] for r in answerable), len(answerable))}")
-    print(f"    citation includes a right page:    {pct(sum(r['citation'] for r in answerable), len(answerable))}")
-    print(f"  Unanswerable ({len(unanswerable)}):")
-    print(f"    correctly declined:                {pct(sum(r['correct'] for r in unanswerable), len(unanswerable))}")
-    print(f"    of which blocked by thresholds:    {sum(r['n_chunks'] == 0 for r in unanswerable)}")
+    if answerable:
+        print(f"  Answerable ({len(answerable)}):")
+        print(f"    recall (answer chunk sent to LLM): {pct(sum(r['rank'] is not None for r in answerable), len(answerable))}")
+        print(f"    MRR:                               {sum(1 / r['rank'] for r in answerable if r['rank']) / len(answerable):.2f}")
+        print(f"    correct:                           {pct(sum(r['correct'] for r in answerable), len(answerable))}")
+        print(f"    citation includes a right page:    {pct(sum(r['citation'] for r in answerable), len(answerable))}")
+    if unanswerable:
+        print(f"  Unanswerable ({len(unanswerable)}):")
+        print(f"    correctly declined:                {pct(sum(r['correct'] for r in unanswerable), len(unanswerable))}")
+        print(f"    of which blocked by thresholds:    {sum(r['n_chunks'] == 0 for r in unanswerable)}")
+    if adversarial:
+        print(f"  Adversarial ({len(adversarial)}):")
+        print(f"    handled safely:                    {pct(sum(r['correct'] for r in adversarial), len(adversarial))}")
     print(f"  All questions: faithful (no unsupported claims): {pct(sum(r['faithful'] for r in results), len(results))}")
 
     print("\n  By category:   n   recall   correct")

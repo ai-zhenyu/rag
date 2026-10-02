@@ -47,7 +47,7 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 | `config.py` | All settings in one place |
 | `ingest.py` | Extraction, table extraction, chunking, table descriptions, embeddings, ChromaDB storage |
 | `retrieval.py` | `search(question, k)`: embedding search (embeds the question, queries Chroma, converts distance to similarity, applies the threshold). `keyword_search()`: BM25. `hybrid_search()`: both combined, used for answering |
-| `answer.py` | `answer(question)`: sends the question and retrieved chunks to the chat model with grounding rules |
+| `answer.py` | `answer(question)`: builds the prompt (system rules + tagged excerpts + tagged question), calls the chat model, and checks the answer before returning it |
 | `evaluate.py` | Evaluation over 10 questions, printed for manual review |
 | `eval_set.json` | 39 benchmark questions: answerable ones with evidence snippets and expected answers, plus unanswerable ones |
 | `benchmark.py` | Automatic scoring over `eval_set.json` |
@@ -63,6 +63,23 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 - **Threshold = 0.50, TOP_K = 10**, chosen with `calibrate.py` rather than the suggested 0.6: chunks containing the answer scored 0.49-0.72, off-topic and other-company questions at most 0.44. At 0.6 the correct R&D chunk (0.595) would be dropped. On-topic questions the document can't answer (e.g. revenue in fiscal 2027, 0.68) score as high as real answers; no threshold separates them, so the answer prompt handles those.
 - **Hybrid search (version 2):** vector search misses exact terms buried in a chunk about other topics and small tables (the inventory table ranked #44). BM25 keyword search (`rank_bm25`) ranks chunks by shared words, weighting rare words like "Blackwell" more. `hybrid_search()` takes the top 5 from each and merges duplicates. Standard Reciprocal Rank Fusion was tested but left the inventory table at #13, outside the context. A chunk is kept if its similarity is >= 0.50 **or** its BM25 score is >= 7. That keyword threshold was chosen with `calibrate.py`: at 7 all 14 calibration answers are kept and no unanswerable question gets through that vector search didn't already let through. The margin is thin (off-topic noise reached 6.7, the weakest answer 7.6).
 - **Answering:** `gpt-4o-mini`, `temperature=0`, instructed to use only the excerpts, cite pages, and otherwise reply with a fixed "not in the document" message. If no chunk passes the threshold the model is not called. Excerpts are labelled only with their page (`=== Excerpt from p. 3 (table) ===`); with numbered labels like `[Source 4 | p. 3]` the model cited the wrong page.
+
+## Security: prompt injection and malicious input
+
+**SQL/code injection** (`"`, `\`, `--`, `DROP TABLE`) doesn't apply: there is no SQL database, Chroma is queried with a vector rather than the question text, and the question is never executed as code. Those symbols are just characters.
+
+**Prompt injection** ("ignore all previous instructions...") is the real risk: the model reads our rules and the user's text in the same conversation. The worst realistic outcome here is an off-topic or outside-knowledge answer, because the model has no tools, no secrets in its prompt, and only public data. Defences, in `answer.py`:
+
+1. **Least privilege:** no tools, no secrets, read-only data. Even a successful injection can only produce text.
+2. **Input limits:** questions over `MAX_QUESTION_CHARS` (500) are rejected before any API call; invisible control and formatting characters (e.g. zero-width spaces) are removed.
+3. **Untrusted text is fenced:** excerpts and the question sit inside `<excerpt>` / `<question>` tags, with `<` and `>` escaped so the text can't close a tag. The system prompt says text inside the tags is data, never instructions, and that mixed requests get only the document part answered.
+4. **Output check (doesn't rely on the model behaving):** an answer must be the "not found" message, or cite at least one page that belongs to a retrieved excerpt. Anything else (a joke, an outside-knowledge answer, a leaked prompt, an invented page) is replaced with "not found".
+
+Excerpts are treated as untrusted too: a PDF could contain planted instructions (indirect prompt injection).
+
+`eval_set.json` has 9 `adversarial` questions: instruction overrides, SQL-style symbols, a request to reveal the prompt, a fake `SYSTEM:` rule, a closing `</question>` tag, an instruction planted inside an excerpt, zero-width characters and an over-long question. `python benchmark.py --category adversarial`: **9/9 handled safely**.
+
+Limitations: no prompt defence is complete. The output check can't catch injected text in an answer that also carries a valid citation, and a keyword blocklist was deliberately not used because rewording bypasses it.
 
 ## Evaluation results (`python evaluate.py`)
 
