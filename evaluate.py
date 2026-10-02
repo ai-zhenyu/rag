@@ -11,7 +11,7 @@ import sys
 
 import config
 from answer import answer
-from retrieval import format_pages, hybrid_search, search
+from retrieval import format_source, hybrid_search, search
 
 # (question, what it tests, expected answer taken from the PDF)
 QUESTIONS = [
@@ -54,7 +54,7 @@ def print_chunks(chunks, full):
         status = "kept   " if c["kept"] else "dropped"
         keyword = f"  bm25={c['bm25_score']:5.1f}  by {c['found_by']:<7}" if "bm25_score" in c else ""
         text = c["text"] if full else " ".join(c["text"].split())[:120] + "..."
-        print(f"  #{rank:<2} {status} similarity={c['similarity']:.3f}{keyword}  {format_pages(c):<9} "
+        print(f"  #{rank:<2} {status} similarity={c['similarity']:.3f}{keyword}  {format_source(c):<24} "
               f"{c['type']:<5}  {text}")
 
 

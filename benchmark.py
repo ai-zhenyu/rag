@@ -19,11 +19,13 @@ import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from pathlib import Path
 
 from openai import OpenAI, RateLimitError
 
 import config
-from answer import EMPTY, NOT_FOUND, TOO_LONG, answer, build_context, cited_pages
+from answer import EMPTY, NOT_FOUND, TOO_LONG, answer, build_context, citations
 from retrieval import hybrid_search, search
 
 JUDGE_MODEL = "gpt-4o"  # stronger than the answering model, so it isn't grading its own work
@@ -51,15 +53,13 @@ Return JSON with:
 
 _judge = OpenAI()
 REFUSALS = (NOT_FOUND, TOO_LONG, EMPTY)  # fixed messages, graded by rule instead of by the judge
+DEFAULT_SOURCE = "nvidia-1.pdf"  # questions in eval_set.json without a "source" field are about this file
 
 
-def evidence_pages(evidence):
-    """Every page whose extracted text contains one of the evidence snippets.
-
-    Computed from the --dump file instead of hand-written page lists, which missed pages where
-    a fact is repeated (the $50.0 billion buyback approval appears on pp. 20, 32 and 40).
-    """
-    dump = config.EXTRACTED_DIR / f"{config.PDF_PATH.stem}.txt"
+@lru_cache
+def page_texts(source):
+    """{page number: text} for one PDF, read from its --dump file."""
+    dump = config.EXTRACTED_DIR / f"{Path(source).stem}.txt"
     if not dump.exists():
         sys.exit(f"{dump} not found: run `python ingest.py --dump` first")
     pages = {}
@@ -68,7 +68,16 @@ def evidence_pages(evidence):
             page = int(section)
         else:
             pages[page] = pages.get(page, "") + section
-    return {page for page, text in pages.items() if any(e in text for e in evidence)}
+    return pages
+
+
+def evidence_pages(evidence, source):
+    """(file, page) for every page of `source` whose extracted text contains an evidence snippet.
+
+    Computed from the --dump file instead of hand-written page lists, which missed pages where
+    a fact is repeated (the $50.0 billion buyback approval appears on pp. 20, 32 and 40).
+    """
+    return {(source, page) for page, text in page_texts(source).items() if any(e in text for e in evidence)}
 
 
 def retrieve(question, vector_only):
@@ -104,7 +113,9 @@ def judge(item, answer_text, chunks):
 def retrieve_and_answer(item, vector_only):
     chunks = retrieve(item["question"], vector_only)
     if "inject" in item:  # indirect prompt injection test: a fake excerpt with planted instructions
-        chunks = chunks[:2] + [{"text": item["inject"], "page_start": 30, "page_end": 30, "type": "text"}] + chunks[2:]
+        fake = {"text": item["inject"], "page_start": 30, "page_end": 30, "type": "text",
+                "source": item.get("source", DEFAULT_SOURCE)}
+        chunks = chunks[:2] + [fake] + chunks[2:]
     return chunks, answer(item["question"], chunks)
 
 
@@ -115,7 +126,9 @@ def score(item, chunks, answer_text, verdict):
     if item["evidence"]:
         rank = next((r for r, c in enumerate(chunks, 1) if any(e in c["text"] for e in item["evidence"])), None)
         result["rank"] = rank
-        result["citation"] = bool(cited_pages(answer_text) & evidence_pages(item["evidence"]))
+        source = item.get("source", DEFAULT_SOURCE)
+        cited = {(file or source, page) for file, page in citations(answer_text)}  # no file named: assume `source`
+        result["citation"] = bool(cited & evidence_pages(item["evidence"], source))
     return result
 
 

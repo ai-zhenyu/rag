@@ -1,7 +1,7 @@
 # PDF Semantic Search / RAG Pipeline
 
-Ask questions about a PDF and get answers grounded in the document, with page citations.
-Built on NVIDIA's Form 10-Q for the quarter ended July 28, 2024 (`data/nvidia-1.pdf`).
+Ask questions about one or more PDFs and get answers grounded in the documents, with file and page citations.
+Built and evaluated on NVIDIA's Form 10-Q for the quarter ended July 28, 2024 (`data/nvidia-1.pdf`).
 
 ```
 PDF ──► extract (unstructured + pdfplumber) ──► chunk (tiktoken) ──► embed (OpenAI) ──► ChromaDB
@@ -30,8 +30,8 @@ With the venv active:
 
 | Command | What it does |
 |---|---|
-| `python ingest.py` | Steps 2-5: extract the PDF, chunk it, embed the chunks, store them in `chroma_db/`. Run once, and again after changing the PDF or chunking settings (about 1.5 min). |
-| `python ingest.py --dump` | Same, and also writes the extracted text and tables to `data/extracted/nvidia-1.txt` for inspection. |
+| `python ingest.py` | Steps 2-5: extract every PDF in `data/`, chunk them, embed the chunks, store them in `chroma_db/`. The collection is rebuilt from scratch, so run it again after adding, removing or changing a PDF, or changing chunking settings (about 1.5 min for the 80-page 10-Q). |
+| `python ingest.py --dump` | Same, and also writes each PDF's extracted text and tables to `data/extracted/<name>.txt` for inspection. |
 | `python retrieval.py "your question" [k]` | Steps 6-7: show the top k vector-search chunks with similarity scores, then the hybrid-search chunks with similarity and BM25 scores, and whether each passes the thresholds. |
 | `python answer.py "your question"` | Step 8: answer the question from the document, citing pages. |
 | `python evaluate.py` | Step 9: run 10 test questions, printing retrieved chunks, scores, the answer and the expected answer. `python evaluate.py 1 7` runs selected questions; `--full` prints whole chunks; `--vector-only` runs version 1 (no keyword search) for comparison. |
@@ -64,6 +64,18 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 - **Hybrid search (version 2):** vector search misses exact terms buried in a chunk about other topics and small tables (the inventory table ranked #44). BM25 keyword search (`rank_bm25`) ranks chunks by shared words, weighting rare words like "Blackwell" more. `hybrid_search()` takes the top 5 from each and merges duplicates. Standard Reciprocal Rank Fusion was tested but left the inventory table at #13, outside the context. A chunk is kept if its similarity is >= 0.50 **or** its BM25 score is >= 7. That keyword threshold was chosen with `calibrate.py`: at 7 all 14 calibration answers are kept and no unanswerable question gets through that vector search didn't already let through. The margin is thin (off-topic noise reached 6.7, the weakest answer 7.6).
 - **Answering:** `gpt-4o-mini`, `temperature=0`, instructed to use only the excerpts, cite pages, and otherwise reply with a fixed "not in the document" message. If no chunk passes the threshold the model is not called. Excerpts are labelled only with their page (`=== Excerpt from p. 3 (table) ===`); with numbered labels like `[Source 4 | p. 3]` the model cited the wrong page.
 
+## Multiple PDFs
+
+Every `*.pdf` in `data/` is ingested. Each chunk records its file in the `source` metadata and gets a unique id (`nvidia-1.pdf#0042`). Excerpts are labelled with file and pages, answers cite both, e.g. `(nvidia-1.pdf, p. 3)`, and the output check verifies the (file, page) pair, so a correct page number in the wrong file is rejected. A citation without a file name is accepted only when all excerpts come from one document. The prompt tells the model not to merge facts from different documents.
+
+Tested with a second, fictional 2-page PDF (since removed): questions about each file cited the right file, and a comparison question cited each fact to its own document.
+
+Limitations:
+- **Similar documents compete.** A question that doesn't name a company or period ("What was total revenue for the quarter?") retrieved only one document's chunks, and the answer didn't mention that another document exists. Name the company or period in the question.
+- **Thresholds were calibrated on the 10-Q alone.** BM25 scores depend on word rarity across all chunks, so re-run `calibrate.py` after adding documents.
+- File names shouldn't contain spaces, commas, semicolons or parentheses (`ingest.py` warns), or citations can't be checked reliably.
+- `eval_set.json`, `evaluate.py` and `calibrate.py` cover the 10-Q only; benchmark questions can name another file with a `"source"` field.
+
 ## Security: prompt injection and malicious input
 
 **SQL/code injection** (`"`, `\`, `--`, `DROP TABLE`) doesn't apply: there is no SQL database, Chroma is queried with a vector rather than the question text, and the question is never executed as code. Those symbols are just characters.
@@ -73,7 +85,7 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 1. **Least privilege:** no tools, no secrets, read-only data. Even a successful injection can only produce text.
 2. **Input limits:** questions over `MAX_QUESTION_CHARS` (500) are rejected before any API call; invisible control and formatting characters (e.g. zero-width spaces) are removed.
 3. **Untrusted text is fenced:** excerpts and the question sit inside `<excerpt>` / `<question>` tags, with `<` and `>` escaped so the text can't close a tag. The system prompt says text inside the tags is data, never instructions, and that mixed requests get only the document part answered.
-4. **Output check (doesn't rely on the model behaving):** an answer must be the "not found" message, or cite at least one page that belongs to a retrieved excerpt. Anything else (a joke, an outside-knowledge answer, a leaked prompt, an invented page) is replaced with "not found".
+4. **Output check (doesn't rely on the model behaving):** an answer must be the "not found" message, or cite at least one file and page that belongs to a retrieved excerpt. Anything else (a joke, an outside-knowledge answer, a leaked prompt, an invented page) is replaced with "not found".
 
 Excerpts are treated as untrusted too: a PDF could contain planted instructions (indirect prompt injection).
 

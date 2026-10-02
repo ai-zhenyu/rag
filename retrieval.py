@@ -155,6 +155,11 @@ def format_pages(chunk):
     return f"p. {start}" if start == end else f"pp. {start}-{end}"
 
 
+def format_source(chunk):
+    """File and pages of a chunk, e.g. "nvidia-1.pdf, pp. 26-27"."""
+    return f"{chunk['source']}, {format_pages(chunk)}"
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")  # Windows console can't print some PDF symbols otherwise
 
@@ -167,7 +172,7 @@ if __name__ == "__main__":
         status = "kept   " if chunk["similarity"] >= config.SIMILARITY_THRESHOLD else "DROPPED"
         preview = " ".join(chunk["text"].split())[:120]
         print(f"#{rank:<2} {status} similarity={chunk['similarity']:.4f} (distance={chunk['distance']:.4f})  "
-              f"{format_pages(chunk):<9} {chunk['type']:<5}  {preview}")
+              f"{format_source(chunk):<24} {chunk['type']:<5}  {preview}")
 
     print(f"\nHYBRID SEARCH: top {config.HYBRID_VECTOR_K} vector + top {config.HYBRID_KEYWORD_K} keyword "
           f"(kept if similarity >= {config.SIMILARITY_THRESHOLD} or BM25 >= {config.KEYWORD_SCORE_THRESHOLD})")
@@ -175,4 +180,4 @@ if __name__ == "__main__":
         status = "kept   " if chunk["kept"] else "DROPPED"
         preview = " ".join(chunk["text"].split())[:100]
         print(f"{status} sim={chunk['similarity']:.3f} bm25={chunk['bm25_score']:5.1f} by {chunk['found_by']:<7} "
-              f"{format_pages(chunk):<9} {chunk['type']:<5}  {preview}")
+              f"{format_source(chunk):<24} {chunk['type']:<5}  {preview}")

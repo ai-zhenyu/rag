@@ -1,7 +1,9 @@
-"""Ingestion pipeline: PDF -> pages -> chunks -> embeddings -> ChromaDB.
+"""Ingestion pipeline: PDFs -> pages -> chunks -> embeddings -> ChromaDB.
+
+Every PDF in data/ is ingested; the collection is rebuilt from scratch on each run.
 
 Run:  python ingest.py
-      python ingest.py --dump   # also save the extracted text to data/extracted/
+      python ingest.py --dump   # also save each PDF's extracted text to data/extracted/<name>.txt
 """
 import re
 import sys
@@ -245,11 +247,11 @@ def store_chunks(chunks):
         configuration={"hnsw": {"space": "cosine"}},  # default would be "l2"
     )
     collection.add(
-        ids=[f"chunk-{i:04d}" for i in range(len(chunks))],
+        ids=[c["id"] for c in chunks],
         documents=[c["text"] for c in chunks],
         embeddings=[c["embedding"] for c in chunks],
         metadatas=[{"n_tokens": c["n_tokens"], "page_start": c["page_start"],
-                    "page_end": c["page_end"], "type": c["type"], "source": config.PDF_PATH.name,
+                    "page_end": c["page_end"], "type": c["type"], "source": c["source"],
                     **({"description": c["description"]} if "description" in c else {})}
                    for c in chunks],
     )
@@ -273,25 +275,47 @@ def dump_pages(pages, tables, pdf_path):
     return out_path
 
 
+def find_pdfs():
+    """Every PDF in data/, in name order."""
+    pdfs = sorted(config.DATA_DIR.glob("*.pdf"))
+    if not pdfs:
+        sys.exit(f"No PDFs found in {config.DATA_DIR}")
+    for pdf in pdfs:
+        if re.search(r"[\s(),;]", pdf.name):
+            print(f"WARNING: rename '{pdf.name}' without spaces, commas, semicolons or parentheses; "
+                  f"citations like ({pdf.name}, p. 3) can't be checked reliably otherwise")
+    return pdfs
+
+
+def ingest_pdf(pdf_path, dump=False):
+    """Extract and chunk one PDF. Every chunk records its file in "source" and gets a unique id."""
+    tables = extract_tables(pdf_path)
+    pages = extract_pages(pdf_path, tables)
+    total_chars = sum(len(text) for _, text in pages)
+    print(f"{pdf_path.name}: {len(pages)} pages, {total_chars:,} characters of text, {len(tables)} tables")
+    if dump:
+        print(f"  wrote extracted text to {dump_pages(pages, tables, pdf_path)}")
+
+    chunks = chunk_text(pages) + chunk_tables(tables)
+    for i, chunk in enumerate(chunks):
+        chunk["source"] = pdf_path.name
+        chunk["id"] = f"{pdf_path.name}#{i:04d}"  # unique across files, e.g. "nvidia-1.pdf#0042"
+    for kind in ("text", "table"):
+        sizes = [c["n_tokens"] for c in chunks if c["type"] == kind]
+        if sizes:
+            in_range = sum(config.MIN_CHUNK_TOKENS <= n <= config.MAX_CHUNK_TOKENS for n in sizes)
+            print(f"  {kind:>5} chunks: {len(sizes):>3} | tokens min={min(sizes)} avg={sum(sizes) // len(sizes)} "
+                  f"max={max(sizes)} | in {config.MIN_CHUNK_TOKENS}-{config.MAX_CHUNK_TOKENS}: {in_range}")
+    return chunks
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")  # Windows console can't print some PDF symbols otherwise
 
-    tables = extract_tables(config.PDF_PATH)
-    pages = extract_pages(config.PDF_PATH, tables)
-    total_chars = sum(len(text) for _, text in pages)
-    print(f"Extracted {len(pages)} pages, {total_chars:,} characters of text, "
-          f"and {len(tables)} tables from {config.PDF_PATH.name}")
-
-    if "--dump" in sys.argv:
-        print(f"Wrote extracted text to {dump_pages(pages, tables, config.PDF_PATH)}")
-
-    chunks = chunk_text(pages) + chunk_tables(tables)
-    for kind in ("text", "table"):
-        sizes = [c["n_tokens"] for c in chunks if c["type"] == kind]
-        in_range = sum(config.MIN_CHUNK_TOKENS <= n <= config.MAX_CHUNK_TOKENS for n in sizes)
-        print(f"{kind:>5} chunks: {len(sizes):>3} | tokens min={min(sizes)} avg={sum(sizes) // len(sizes)} "
-              f"max={max(sizes)} | in {config.MIN_CHUNK_TOKENS}-{config.MAX_CHUNK_TOKENS}: {in_range}")
-    print(f"total chunks: {len(chunks)}, total tokens: {sum(c['n_tokens'] for c in chunks):,}")
+    chunks = []
+    for pdf in find_pdfs():
+        chunks += ingest_pdf(pdf, dump="--dump" in sys.argv)
+    print(f"total: {len(chunks)} chunks, {sum(c['n_tokens'] for c in chunks):,} tokens")
 
     print(f"Describing {sum(c['type'] == 'table' for c in chunks)} table chunks with {config.CHAT_MODEL}...")
     describe_tables(chunks)
