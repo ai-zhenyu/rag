@@ -8,6 +8,7 @@ Run:  python retrieval.py "What was NVIDIA's revenue?"  [k]
 """
 import re
 import sys
+from itertools import zip_longest
 
 import chromadb
 from dotenv import load_dotenv
@@ -45,17 +46,18 @@ def _to_chunks(ids, documents, metadatas):
     return [{"id": id_, "text": doc, **meta} for id_, doc, meta in zip(ids, documents, metadatas)]
 
 
-def search(question, k=config.TOP_K, threshold=config.SIMILARITY_THRESHOLD, question_embedding=None):
+def search(question, k=config.TOP_K, threshold=config.SIMILARITY_THRESHOLD, question_embedding=None, source=None):
     """Embedding search: return up to k chunks most similar to the question, most similar first.
 
     Chunks whose similarity is below `threshold` are dropped, so fewer than k (even zero)
-    may come back. Pass threshold=None to get the raw top k.
+    may come back. Pass threshold=None to get the raw top k. `source` limits the search to one file.
 
-    Each result: {"id", "text", "page_start", "page_end", "type", "n_tokens", "distance", "similarity"}
+    Each result: {"id", "text", "page_start", "page_end", "type", "n_tokens", "source", "distance", "similarity"}
     """
     results = get_collection().query(
         query_embeddings=[question_embedding or embed_question(question)],  # our OpenAI vector
         n_results=k,
+        where={"source": source} if source else None,
         include=["documents", "metadatas", "distances"],
     )
     # Chroma answers a list of queries at once; we sent one, so take element [0] of each field.
@@ -95,42 +97,31 @@ def bm25_scores(question):
     return {c["id"]: float(s) for c, s in zip(chunks, index.get_scores(tokenize(question)))}
 
 
-def keyword_search(question, k=config.HYBRID_KEYWORD_K):
+def keyword_search(question, k=config.HYBRID_KEYWORD_K, source=None, scores=None):
     """BM25 keyword search: return the k chunks whose words best match the question's words.
 
     BM25 rewards chunks containing the question's words, especially words that are rare in the
-    document ("Blackwell"), and slightly favors shorter chunks. Each result gets a "bm25_score".
+    documents ("Blackwell"), and slightly favors shorter chunks. Each result gets a "bm25_score".
+    `source` limits the search to one file; `scores` reuses already computed bm25_scores().
     """
     _, chunks = _get_bm25()
-    scores = bm25_scores(question)
-    best = sorted(chunks, key=lambda c: scores[c["id"]], reverse=True)[:k]
+    scores = scores or bm25_scores(question)
+    candidates = [c for c in chunks if source is None or c["source"] == source]
+    best = sorted(candidates, key=lambda c: scores[c["id"]], reverse=True)[:k]
     return [{**c, "bm25_score": scores[c["id"]]} for c in best]
 
 
-def hybrid_search(question, apply_thresholds=True):
-    """Combine the top vector chunks and the top keyword chunks (duplicates merged).
-
-    Vector search finds the same meaning in different words; keyword search finds exact names,
-    numbers and rare terms that vector search can miss. A chunk is kept if its similarity reaches
-    SIMILARITY_THRESHOLD or its BM25 score reaches KEYWORD_SCORE_THRESHOLD.
-
-    Every result has "similarity", "bm25_score", "found_by" ("vector", "keyword" or "both")
-    and "kept". With apply_thresholds=False all candidates are returned (evaluate.py shows them).
-    """
-    question_embedding = embed_question(question)
-    vector_hits = search(question, k=config.HYBRID_VECTOR_K, threshold=None, question_embedding=question_embedding)
-    keyword_hits = keyword_search(question)
-
-    # Interleave the two rankings (vector #1, keyword #1, vector #2, ...) and merge duplicates.
+def _merge_hits(vector_hits, keyword_hits, question_embedding, scores):
+    """Interleave two rankings (vector #1, keyword #1, vector #2, ...), merge duplicates, and give
+    every chunk both scores, "found_by" and "kept"."""
     merged = {}
-    for pair in zip(vector_hits, keyword_hits):
+    for pair in zip_longest(vector_hits, keyword_hits):
         for hit in pair:
-            merged.setdefault(hit["id"], {}).update(hit)
+            if hit:
+                merged.setdefault(hit["id"], {}).update(hit)
     vector_ids = {c["id"] for c in vector_hits}
     keyword_ids = {c["id"] for c in keyword_hits}
 
-    # Fill in the score each chunk is missing, so every result shows both.
-    all_scores = bm25_scores(question)
     missing_sim = [id_ for id_ in merged if "similarity" not in merged[id_]]
     if missing_sim:
         stored = get_collection().get(ids=missing_sim, include=["embeddings"])
@@ -138,16 +129,46 @@ def hybrid_search(question, apply_thresholds=True):
             # OpenAI embeddings have length 1, so cosine similarity is just the dot product.
             merged[id_]["similarity"] = float(sum(a * b for a, b in zip(question_embedding, emb)))
 
-    results = []
     for id_, chunk in merged.items():
-        chunk["bm25_score"] = all_scores[id_]
+        chunk["bm25_score"] = scores[id_]
         chunk["found_by"] = "both" if id_ in vector_ids and id_ in keyword_ids else (
             "vector" if id_ in vector_ids else "keyword")
         chunk["kept"] = (chunk["similarity"] >= config.SIMILARITY_THRESHOLD
                          or chunk["bm25_score"] >= config.KEYWORD_SCORE_THRESHOLD)
-        results.append(chunk)
+    return list(merged.values())
 
-    return [c for c in results if c["kept"]] if apply_thresholds else results
+
+def hybrid_search(question, apply_thresholds=True):
+    """Vector + keyword search, run separately for every document, results merged.
+
+    Vector search finds the same meaning in different words; keyword search finds exact names,
+    numbers and rare terms that vector search can miss. Searching each document separately gives
+    every document a fair chance: searched together, "Compare NVIDIA's and AMD's revenue"
+    returned only NVIDIA chunks in the top 5 (AMD's revenue chunk ranked #33).
+
+    A chunk is kept if its similarity reaches SIMILARITY_THRESHOLD or its BM25 score reaches
+    KEYWORD_SCORE_THRESHOLD, so documents with nothing relevant contribute nothing. Results are
+    grouped by document, the best-matching document first.
+
+    Every result has "similarity", "bm25_score", "found_by" ("vector", "keyword" or "both")
+    and "kept". With apply_thresholds=False all candidates are returned (evaluate.py shows them).
+    """
+    question_embedding = embed_question(question)
+    scores = bm25_scores(question)
+    _, all_chunks = _get_bm25()
+
+    groups = []
+    for source in sorted({c["source"] for c in all_chunks}):
+        vector_hits = search(question, k=config.HYBRID_VECTOR_K, threshold=None,
+                             question_embedding=question_embedding, source=source)
+        keyword_hits = keyword_search(question, source=source, scores=scores)
+        group = _merge_hits(vector_hits, keyword_hits, question_embedding, scores)
+        if apply_thresholds:
+            group = [c for c in group if c["kept"]]
+        if group:
+            groups.append(group)
+    groups.sort(key=lambda g: max(c["similarity"] for c in g), reverse=True)
+    return [c for group in groups for c in group]
 
 
 def format_pages(chunk):

@@ -36,6 +36,10 @@ Rules:
   the source of the excerpt the fact came from.
 - Excerpts may come from different documents. Don't combine facts from different documents as if they
   were one; when several documents are relevant, say which document each fact comes from.
+- If the question doesn't say which company or document it means, and excerpts from several documents
+  answer it, answer for each of them, naming the company or document in the sentence.
+- If the question compares documents, answer each part the excerpts support, and say which part
+  they don't support.
 - Tables are written one row per line as "Label | value | value | ...". The values follow the column
   headers above them in the same left-to-right order. If a table says "(In millions)", its amounts
   are in millions; say so in the answer.
