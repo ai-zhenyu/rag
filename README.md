@@ -68,10 +68,17 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 
 Every `*.pdf` in `data/` is ingested. Each chunk records its file in the `source` metadata and gets a unique id (`nvidia-1.pdf#0042`). Excerpts are labelled with file and pages, answers cite both, e.g. `(nvidia-1.pdf, p. 3)`, and the output check verifies the (file, page) pair, so a correct page number in the wrong file is rejected. A citation without a file name is accepted only when all excerpts come from one document. The prompt tells the model not to merge facts from different documents.
 
-Tested with a second, fictional 2-page PDF (since removed): questions about each file cited the right file, and a comparison question cited each fact to its own document.
+**Retrieval runs per document.** `hybrid_search()` does the vector and keyword searches once per file and merges the results, grouped by document. Searched together, "Compare NVIDIA's and AMD's revenue" got only NVIDIA chunks in the top 5 (AMD's revenue chunk ranked #33); per document, both companies' figures are found and cited. The thresholds still keep unrelated files out (a revenue question retrieves nothing from a homework PDF).
+
+**Unreadable files are skipped.** Each page's text is checked before chunking: under 50 characters means no text layer (a scan), and a high share of `(cid:N)` codes or control characters means the fonts can't be decoded (common with a browser's "Print to PDF"). Bad pages are dropped; a file with more than half its pages bad is skipped with a message explaining why.
+
+Tested with NVIDIA's and AMD's 10-Qs plus an unrelated homework PDF (the last two are not committed): questions about each file cite the right file, and comparisons cite each company's figure to its own document.
 
 Limitations:
-- **Similar documents compete.** A question that doesn't name a company or period ("What was total revenue for the quarter?") retrieved only one document's chunks, and the answer didn't mention that another document exists. Name the company or period in the question.
+- **Ambiguous questions are answered inconsistently.** When a question doesn't name a company ("What was Data Center revenue last quarter?"), the prompt asks the model to answer for every document that has the answer. `gpt-4o-mini` does this only sometimes: gross margin was answered for both companies, Data Center revenue only for AMD, although NVIDIA's figure was in the context. Rewording the rule more strongly made it worse. A structural fix would be to answer each document separately and then combine the answers (more LLM calls). Until then, name the company in the question.
+- **More context per question.** Every document contributes its passing chunks, so with two 10-Qs a financial question sends ~7-8K input tokens instead of ~3K (about $0.0012 instead of $0.0005 per question), including chunks from the company not asked about.
+- **Unanswerable test questions depend on the document set.** Adding AMD's 10-Q made "Who is the CEO of AMD?" answerable (Dr. Lisa Su, amd-1.pdf, p. 56), so that adversarial test had to change. Re-check `eval_set.json` when documents are added.
+- **Scanned PDFs and broken fonts are skipped, not read.** Reading them needs OCR.
 - **Thresholds were calibrated on the 10-Q alone.** BM25 scores depend on word rarity across all chunks, so re-run `calibrate.py` after adding documents.
 - File names shouldn't contain spaces, commas, semicolons or parentheses (`ingest.py` warns), or citations can't be checked reliably.
 - `eval_set.json`, `evaluate.py` and `calibrate.py` cover the 10-Q only; benchmark questions can name another file with a `"source"` field.
