@@ -172,12 +172,14 @@ def hybrid_search(question, apply_thresholds=True):
 
 
 def format_pages(chunk):
+    """Location of a chunk: pages for PDFs ("p. 3", "pp. 26-27"), sections for Word files ("sec. 3")."""
     start, end = chunk["page_start"], chunk["page_end"]
-    return f"p. {start}" if start == end else f"pp. {start}-{end}"
+    one, many = ("sec.", "secs.") if chunk.get("unit") == "section" else ("p.", "pp.")
+    return f"{one} {start}" if start == end else f"{many} {start}-{end}"
 
 
 def format_source(chunk):
-    """File and pages of a chunk, e.g. "nvidia-1.pdf, pp. 26-27"."""
+    """File and location of a chunk, e.g. "nvidia-1.pdf, pp. 26-27" or "policy.docx, sec. 3"."""
     return f"{chunk['source']}, {format_pages(chunk)}"
 
 

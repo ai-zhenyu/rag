@@ -1,20 +1,23 @@
-"""Ingestion pipeline: PDFs -> pages -> chunks -> embeddings -> ChromaDB.
+"""Ingestion pipeline: documents -> pages/sections -> chunks -> embeddings -> ChromaDB.
 
-Every PDF in data/ is ingested; the collection is rebuilt from scratch on each run.
+Every PDF and Word (.docx) file in data/ is ingested; the collection is rebuilt from scratch on each run.
+PDF chunks are located by page; Word chunks by section (Word files have no fixed pages).
 
 Run:  python ingest.py
-      python ingest.py --dump   # also save each PDF's extracted text to data/extracted/<name>.txt
+      python ingest.py --dump   # also save each document's extracted text to data/extracted/<name>.txt
 """
 import re
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from html.parser import HTMLParser
 
 import chromadb
 import pdfplumber
 import tiktoken
 from dotenv import load_dotenv
 from openai import OpenAI
+from unstructured.partition.docx import partition_docx
 from unstructured.partition.pdf import partition_pdf
 
 import config
@@ -26,11 +29,11 @@ ENCODER = tiktoken.get_encoding(config.TOKEN_ENCODING)
 TABLE_HEADER_BAND = 80
 
 TABLE_DESCRIPTION_PROMPT = (
-    "Write a short search description of this table from a company's financial report. Start with the "
-    "table's specific topic, taken from its title or from the section label directly above the rows "
+    "Write a short search description of this table from a document such as a financial report. Start with "
+    "the table's specific topic, taken from its title or from the section label directly above the rows "
     '(e.g. "Inventories", not a generic heading); ignore any unrelated sentences above the table. Then '
-    "give the reporting periods of the columns, and list EVERY row label so each one can be found by "
-    "search. Do not quote any numbers. Do not invent anything.\n\n{table}"
+    "say what the columns represent (e.g. reporting periods), and list EVERY row label so each one can be "
+    "found by search. Do not quote any numbers. Do not invent anything.\n\n{table}"
 )
 
 
@@ -252,29 +255,102 @@ def store_chunks(chunks):
         ids=[c["id"] for c in chunks],
         documents=[c["text"] for c in chunks],
         embeddings=[c["embedding"] for c in chunks],
+        # For Word files page_start/page_end hold section numbers, and "unit" says which it is.
         metadatas=[{"n_tokens": c["n_tokens"], "page_start": c["page_start"],
-                    "page_end": c["page_end"], "type": c["type"], "source": c["source"],
+                    "page_end": c["page_end"], "type": c["type"], "source": c["source"], "unit": c["unit"],
+                    **({"section_titles": c["section_titles"]} if c.get("section_titles") else {}),
                     **({"description": c["description"]} if "description" in c else {})}
                    for c in chunks],
     )
     return collection
 
 
-def dump_pages(pages, tables, pdf_path):
-    """Write extracted text and tables to data/extracted/<pdf name>.txt for inspection."""
+def dump_pages(pages, tables, path, label=lambda n: f"page {n}"):
+    """Write extracted text and tables to data/extracted/<file name>.txt for inspection.
+
+    `label` names each part: "page 3" for PDFs, "section 3: Meals" for Word files.
+    """
     tables_by_page = defaultdict(list)
     for t in tables:
         tables_by_page[t["page"]].append(t["text"])
 
     sections = []
     for page, text in pages:
-        sections.append(f"=== page {page} ===\n{text}")
+        sections.append(f"=== {label(page)} ===\n{text}")
         sections.extend(tables_by_page[page])
 
     config.EXTRACTED_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = config.EXTRACTED_DIR / f"{pdf_path.stem}.txt"
+    out_path = config.EXTRACTED_DIR / f"{path.stem}.txt"
     out_path.write_text("\n\n".join(sections), encoding="utf-8")
     return out_path
+
+
+class _TableHTMLParser(HTMLParser):
+    """Collect the cell texts of an HTML table, row by row."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows, self._cell = [], None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.rows.append([])
+        elif tag in ("td", "th"):
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None and self.rows:
+            self.rows[-1].append("".join(self._cell))
+            self._cell = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def extract_docx(path):
+    """Split a Word file into numbered sections, one per heading, plus its tables.
+
+    Word files have no fixed pages (unstructured reports no page numbers), so chunks are located
+    by section instead. Returns (sections, tables, titles):
+      sections: [(section number, text)], each starting with its heading
+      tables:   [{"page": section number, "text": rows as "Label | value | ..."}]
+      titles:   {section number: "Heading > Subheading"}
+    Word stores real table structure, so rows come from the table's HTML, not from positions.
+    """
+    sections, tables, titles = [], [], {}
+    current, number, heading_path = [], 0, []
+
+    def start_section(title):
+        nonlocal current, number
+        if current:
+            sections.append((number, "\n\n".join(current)))
+        current, number = [], number + 1
+        titles[number] = title
+
+    for el in partition_docx(filename=str(path)):
+        kind, text = type(el).__name__, el.text.strip()
+        if kind == "Title" and text:
+            depth = el.metadata.category_depth or 0
+            heading_path = [(d, h) for d, h in heading_path if d < depth] + [(depth, text)]
+            start_section(" > ".join(h for _, h in heading_path))
+            current.append(text)
+            continue
+        if number == 0:  # content before the first heading
+            start_section("(start of document)")
+        if kind == "Table":
+            parser = _TableHTMLParser()
+            parser.feed(el.metadata.text_as_html or "")
+            rows = [" | ".join(cells) for cells in map(_clean_row, parser.rows) if cells]
+            context = current[-1:] if len(current) > 1 else []  # the paragraph introducing the table
+            if rows:
+                tables.append({"page": number,
+                               "text": "\n".join([f"[Table in section {number}: {titles[number]}]"] + context + rows)})
+        elif text:
+            current.append(text)
+    if current:
+        sections.append((number, "\n\n".join(current)))
+    return sections, tables, titles
 
 
 # Page text quality checks. Measured on the files in data/: readable pages had a garbage ratio of 0.00,
@@ -297,16 +373,61 @@ def page_problem(text):
     return "unreadable" if garbage / len(text) > MAX_GARBAGE_RATIO else None
 
 
-def find_pdfs():
-    """Every PDF in data/, in name order."""
-    pdfs = sorted(config.DATA_DIR.glob("*.pdf"))
-    if not pdfs:
-        sys.exit(f"No PDFs found in {config.DATA_DIR}")
-    for pdf in pdfs:
-        if re.search(r"[\s(),;]", pdf.name):
-            print(f"WARNING: rename '{pdf.name}' without spaces, commas, semicolons or parentheses; "
-                  f"citations like ({pdf.name}, p. 3) can't be checked reliably otherwise")
-    return pdfs
+SUPPORTED_SUFFIXES = (".pdf", ".docx")
+
+
+def find_documents():
+    """Every PDF and Word (.docx) file in data/, in name order. Other files are reported and ignored."""
+    docs = []
+    for path in sorted(p for p in config.DATA_DIR.iterdir() if p.is_file()):
+        if path.suffix.lower() in SUPPORTED_SUFFIXES:
+            docs.append(path)
+        else:
+            hint = "; open it in Word and save it as .docx" if path.suffix.lower() == ".doc" else ""
+            print(f"{path.name}: ignored, unsupported file type (supported: .pdf, .docx){hint}")
+    if not docs:
+        sys.exit(f"No PDF or Word files found in {config.DATA_DIR}")
+    for path in docs:
+        if re.search(r"[\s(),;]", path.name):
+            print(f"WARNING: rename '{path.name}' without spaces, commas, semicolons or parentheses; "
+                  f"citations like ({path.name}, p. 3) can't be checked reliably otherwise")
+    return docs
+
+
+def _finish_chunks(chunks, path, unit):
+    """Tag every chunk with its file, a unique id and its location unit, and print size statistics."""
+    for i, chunk in enumerate(chunks):
+        chunk["source"] = path.name
+        chunk["id"] = f"{path.name}#{i:04d}"  # unique across files, e.g. "nvidia-1.pdf#0042"
+        chunk["unit"] = unit                   # "page" (PDF) or "section" (Word)
+    for kind in ("text", "table"):
+        sizes = [c["n_tokens"] for c in chunks if c["type"] == kind]
+        if sizes:
+            in_range = sum(config.MIN_CHUNK_TOKENS <= n <= config.MAX_CHUNK_TOKENS for n in sizes)
+            print(f"  {kind:>5} chunks: {len(sizes):>3} | tokens min={min(sizes)} avg={sum(sizes) // len(sizes)} "
+                  f"max={max(sizes)} | in {config.MIN_CHUNK_TOKENS}-{config.MAX_CHUNK_TOKENS}: {in_range}")
+    return chunks
+
+
+def ingest_docx(path, dump=False):
+    """Extract and chunk one Word file, by section."""
+    sections, tables, titles = extract_docx(path)
+    if not sections and not tables:
+        print(f"{path.name}: SKIPPED, no text found")
+        return []
+    total_chars = sum(len(text) for _, text in sections)
+    print(f"{path.name}: {len(titles)} sections, {total_chars:,} characters of text, {len(tables)} tables")
+    if dump:
+        out = dump_pages(sections, tables, path, label=lambda n: f"section {n}: {titles[n]}")
+        print(f"  wrote extracted text to {out}")
+
+    # Chunk each section on its own: unlike PDF page breaks, section breaks separate topics. Packed
+    # across sections, a short policy became one chunk cited as "secs. 1-6". Small sections now make
+    # chunks below MIN_CHUNK_TOKENS, a deliberate trade for precise citations like "sec. 2".
+    chunks = [c for number, text in sections for c in chunk_text([(number, text)])] + chunk_tables(tables)
+    for chunk in chunks:
+        chunk["section_titles"] = "; ".join(titles[n] for n in range(chunk["page_start"], chunk["page_end"] + 1))
+    return _finish_chunks(chunks, path, unit="section")
 
 
 def ingest_pdf(pdf_path, dump=False):
@@ -341,26 +462,18 @@ def ingest_pdf(pdf_path, dump=False):
         print(f"  wrote extracted text to {dump_pages(pages, tables, pdf_path)}")
 
     chunks = chunk_text(pages) + chunk_tables(tables)
-    for i, chunk in enumerate(chunks):
-        chunk["source"] = pdf_path.name
-        chunk["id"] = f"{pdf_path.name}#{i:04d}"  # unique across files, e.g. "nvidia-1.pdf#0042"
-    for kind in ("text", "table"):
-        sizes = [c["n_tokens"] for c in chunks if c["type"] == kind]
-        if sizes:
-            in_range = sum(config.MIN_CHUNK_TOKENS <= n <= config.MAX_CHUNK_TOKENS for n in sizes)
-            print(f"  {kind:>5} chunks: {len(sizes):>3} | tokens min={min(sizes)} avg={sum(sizes) // len(sizes)} "
-                  f"max={max(sizes)} | in {config.MIN_CHUNK_TOKENS}-{config.MAX_CHUNK_TOKENS}: {in_range}")
-    return chunks
+    return _finish_chunks(chunks, pdf_path, unit="page")
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")  # Windows console can't print some PDF symbols otherwise
 
     chunks = []
-    for pdf in find_pdfs():
-        chunks += ingest_pdf(pdf, dump="--dump" in sys.argv)
+    for path in find_documents():
+        ingest = ingest_docx if path.suffix.lower() == ".docx" else ingest_pdf
+        chunks += ingest(path, dump="--dump" in sys.argv)
     if not chunks:
-        sys.exit("No usable text in any PDF; the existing collection was left unchanged.")
+        sys.exit("No usable text in any document; the existing collection was left unchanged.")
     print(f"total: {len(chunks)} chunks from {len({c['source'] for c in chunks})} file(s), "
           f"{sum(c['n_tokens'] for c in chunks):,} tokens")
 

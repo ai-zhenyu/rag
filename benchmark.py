@@ -127,7 +127,8 @@ def score(item, chunks, answer_text, verdict):
         rank = next((r for r, c in enumerate(chunks, 1) if any(e in c["text"] for e in item["evidence"])), None)
         result["rank"] = rank
         source = item.get("source", DEFAULT_SOURCE)
-        cited = {(file or source, page) for file, page in citations(answer_text)}  # no file named: assume `source`
+        cited = {(file or source, page) for file, unit, page in citations(answer_text)  # no file named: assume `source`
+                 if unit == "page"}
         result["citation"] = bool(cited & evidence_pages(item["evidence"], source))
     return result
 

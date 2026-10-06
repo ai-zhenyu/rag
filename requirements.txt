@@ -1,4 +1,4 @@
-unstructured[pdf]==0.18.32
+unstructured[pdf,docx]==0.18.32
 tiktoken==0.14.0
 openai==3.19.2
 chromadb==1.5.9

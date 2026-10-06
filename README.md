@@ -1,6 +1,6 @@
-# PDF Semantic Search / RAG Pipeline
+# Document Semantic Search / RAG Pipeline
 
-Ask questions about one or more PDFs and get answers grounded in the documents, with file and page citations.
+Ask questions about PDF and Word (.docx) documents and get answers grounded in them, with file and page (or section) citations.
 Built and evaluated on NVIDIA's Form 10-Q for the quarter ended July 28, 2024 (`data/nvidia-1.pdf`).
 
 ```
@@ -30,7 +30,7 @@ With the venv active:
 
 | Command | What it does |
 |---|---|
-| `python ingest.py` | Steps 2-5: extract every PDF in `data/`, chunk them, embed the chunks, store them in `chroma_db/`. The collection is rebuilt from scratch, so run it again after adding, removing or changing a PDF, or changing chunking settings (about 1.5 min for the 80-page 10-Q). |
+| `python ingest.py` | Steps 2-5: extract every PDF and Word (.docx) file in `data/`, chunk them, embed the chunks, store them in `chroma_db/`. Other file types are reported and ignored. The collection is rebuilt from scratch, so run it again after adding, removing or changing a document, or changing chunking settings (about 1.5 min for the 80-page 10-Q). |
 | `python ingest.py --dump` | Same, and also writes each PDF's extracted text and tables to `data/extracted/<name>.txt` for inspection. |
 | `python retrieval.py "your question" [k]` | Steps 6-7: show the top k vector-search chunks with similarity scores, then the hybrid-search chunks with similarity and BM25 scores, and whether each passes the thresholds. |
 | `python answer.py "your question"` | Step 8: answer the question from the document, citing pages. |
@@ -82,6 +82,20 @@ Limitations:
 - **Thresholds were calibrated on the 10-Q alone.** BM25 scores depend on word rarity across all chunks, so re-run `calibrate.py` after adding documents.
 - File names shouldn't contain spaces, commas, semicolons or parentheses (`ingest.py` warns), or citations can't be checked reliably.
 - `eval_set.json`, `evaluate.py` and `calibrate.py` cover the 10-Q only; benchmark questions can name another file with a `"source"` field.
+
+## Word documents (.docx)
+
+`.docx` files in `data/` are ingested with `unstructured`'s `partition_docx` (extra: `unstructured[docx]`).
+
+- **Cited by section, not page.** Word files have no fixed pages: page breaks depend on how Word lays the document out, and `unstructured` reports no page numbers. Each heading starts a numbered section, and answers cite e.g. `(policy.docx, sec. 3)`. Excerpts also carry the heading path (e.g. "Reimbursement > Receipts") so the model knows which part of the document they're from. The output check verifies (file, unit, number), so a section number cited as a page is rejected.
+- **Chunked per section.** Unlike PDF page breaks, section breaks separate topics, so chunks never span sections (long sections are still split by paragraph). Packed across sections, a short policy became one chunk cited as "secs. 1-6"; per section, citations are precise ("sec. 2"). Small sections make chunks below 300 tokens, a deliberate trade.
+- **Tables keep their real structure.** Word stores rows and cells, so tables come from their HTML, not from positions on a page, and are converted to the same `Label | value | ...` rows as PDF tables, with the section title and the paragraph introducing the table as header.
+
+Tested with a fictional travel-policy document (not committed): answers to policy questions cited the right sections, a table lookup ("daily meal maximum in London") cited the table's section, and PDF answers were unchanged.
+
+Limitations:
+- Old binary `.doc` files aren't supported (`ingest.py` suggests saving as `.docx`); neither are other formats.
+- Text in images, text boxes and headers/footers may be missed; headings are detected from Word's heading styles, so a document that uses bold text instead of heading styles becomes one long section.
 
 ## Security: prompt injection and malicious input
 
@@ -144,5 +158,6 @@ Findings:
 Lessons from building the benchmark itself:
 - Hand-written citation pages were wrong (the $50.0 billion buyback approval appears on pp. 20, 32 and 40), so accepted pages are now found automatically in the extracted text.
 - The LLM judge marked "not found" as correct for answerable questions and once cited facts that weren't in the excerpts. Refusals are now graded by rule, and the judge is told to use only the excerpts.
+- The judge isn't fully consistent even at temperature 0: the same safe answer to adversarial #42 was graded FAIL in one run and ok in the next. Don't over-read single-question differences between runs.
 
 Next improvements: query rewriting (expanding paraphrases into the document's vocabulary), a re-ranking step, and citing the exact page of cross-page chunks.
