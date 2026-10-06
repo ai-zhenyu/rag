@@ -317,8 +317,12 @@ def ingest_pdf(pdf_path, dump=False):
         n_pages = len(pdf.pages)
 
     # Check every page (including pages that produced no elements at all) before using its text.
-    page_text = dict(pages)
-    problems = {p: page_problem(page_text.get(p, "")) for p in range(1, n_pages + 1)}
+    # A page's tables count too: extract_pages() removed table text from the page text, so a page
+    # that is almost all table would otherwise look empty (AMD's 10-Q p. 7 was wrongly skipped).
+    page_text = defaultdict(str, pages)
+    for t in tables:
+        page_text[t["page"]] += "\n" + t["text"]
+    problems = {p: page_problem(page_text[p]) for p in range(1, n_pages + 1)}
     bad = {p: why for p, why in problems.items() if why}
     if len(bad) > n_pages / 2:
         main_problem = max(set(bad.values()), key=list(bad.values()).count)
