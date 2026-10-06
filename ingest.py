@@ -177,7 +177,9 @@ def chunk_tables(tables):
             continue
 
         lines = t["text"].split("\n")
-        first_row = next(i for i, line in enumerate(lines) if " | " in line)
+        # Header = lines before the first multi-cell row; if no row has several cells, only the
+        # "[Table on page N]" line is header (a table of single-cell rows used to crash here).
+        first_row = next((i for i, line in enumerate(lines) if " | " in line), 1)
         header = "\n".join(lines[:first_row])  # title + column headers, repeated on every part
         rows = lines[first_row:]
         part = []
@@ -275,6 +277,26 @@ def dump_pages(pages, tables, pdf_path):
     return out_path
 
 
+# Page text quality checks. Measured on the files in data/: readable pages had a garbage ratio of 0.00,
+# a browser "Print to PDF" file with broken fonts 0.72-0.99, and a scanned file had no text at all.
+MIN_PAGE_CHARS = 50     # fewer extracted characters: the page is probably a scan/image (needs OCR)
+MAX_GARBAGE_RATIO = 0.3  # more "(cid:N)" codes / control characters than this: the text can't be decoded
+CID_RE = re.compile(r"\(cid:\d+\)")
+PROBLEM_HELP = {
+    "no text": "no text layer (scanned or image-only pages); needs OCR, which the fast strategy doesn't do",
+    "unreadable": "text can't be decoded (fonts without a character map, common with a browser's "
+                  "'Print to PDF'); use the original PDF from the source, or OCR",
+}
+
+
+def page_problem(text):
+    """None if the page's extracted text looks usable, otherwise "no text" or "unreadable"."""
+    if len(text.strip()) < MIN_PAGE_CHARS:
+        return "no text"
+    garbage = sum(map(len, CID_RE.findall(text))) + sum(ord(ch) < 32 and ch not in "\n\t" for ch in text)
+    return "unreadable" if garbage / len(text) > MAX_GARBAGE_RATIO else None
+
+
 def find_pdfs():
     """Every PDF in data/, in name order."""
     pdfs = sorted(config.DATA_DIR.glob("*.pdf"))
@@ -291,6 +313,24 @@ def ingest_pdf(pdf_path, dump=False):
     """Extract and chunk one PDF. Every chunk records its file in "source" and gets a unique id."""
     tables = extract_tables(pdf_path)
     pages = extract_pages(pdf_path, tables)
+    with pdfplumber.open(pdf_path) as pdf:
+        n_pages = len(pdf.pages)
+
+    # Check every page (including pages that produced no elements at all) before using its text.
+    page_text = dict(pages)
+    problems = {p: page_problem(page_text.get(p, "")) for p in range(1, n_pages + 1)}
+    bad = {p: why for p, why in problems.items() if why}
+    if len(bad) > n_pages / 2:
+        main_problem = max(set(bad.values()), key=list(bad.values()).count)
+        print(f"{pdf_path.name}: SKIPPED, {len(bad)} of {n_pages} pages unusable: {PROBLEM_HELP[main_problem]}")
+        return []
+    if bad:
+        for why in sorted(set(bad.values())):
+            pages_list = ", ".join(str(p) for p, w in bad.items() if w == why)
+            print(f"{pdf_path.name}: skipping page(s) {pages_list} ({why})")
+        pages = [(p, text) for p, text in pages if p not in bad]
+        tables = [t for t in tables if t["page"] not in bad]
+
     total_chars = sum(len(text) for _, text in pages)
     print(f"{pdf_path.name}: {len(pages)} pages, {total_chars:,} characters of text, {len(tables)} tables")
     if dump:
@@ -315,7 +355,10 @@ if __name__ == "__main__":
     chunks = []
     for pdf in find_pdfs():
         chunks += ingest_pdf(pdf, dump="--dump" in sys.argv)
-    print(f"total: {len(chunks)} chunks, {sum(c['n_tokens'] for c in chunks):,} tokens")
+    if not chunks:
+        sys.exit("No usable text in any PDF; the existing collection was left unchanged.")
+    print(f"total: {len(chunks)} chunks from {len({c['source'] for c in chunks})} file(s), "
+          f"{sum(c['n_tokens'] for c in chunks):,} tokens")
 
     print(f"Describing {sum(c['type'] == 'table' for c in chunks)} table chunks with {config.CHAT_MODEL}...")
     describe_tables(chunks)
