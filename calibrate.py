@@ -1,4 +1,4 @@
-"""Calibrate SIMILARITY_THRESHOLD and KEYWORD_SCORE_THRESHOLD from real scores instead of guessing.
+"""Calibrate SIMILARITY_THRESHOLD, KEYWORD_SCORE_THRESHOLD and QUESTION_SIMILARITY_THRESHOLD from real scores.
 
 For answerable questions we know a snippet of the correct answer, so we can find the scores of
 the chunk that actually contains it. For unanswerable questions every retrieved chunk is
@@ -14,7 +14,7 @@ Run:  python calibrate.py
 import sys
 
 import config
-from retrieval import bm25_scores, hybrid_search, search
+from retrieval import bm25_scores, embed_question, hybrid_search, question_search, search
 
 # (question, text that appears only in a chunk containing the answer)
 CALIBRATION_ANSWERABLE = [
@@ -72,12 +72,16 @@ def answer_scores(question, needle):
     if not hits:
         return None
     best = max(hits, key=lambda c: c["similarity"])
-    return best["similarity"], bm25_scores(question)[best["id"]]
+    qsim = max((c.get("question_similarity") or 0) for c in hits)
+    return best["similarity"], bm25_scores(question)[best["id"]], qsim
 
 
 def noise_scores(question):
-    """Best similarity and best BM25 score of any chunk (all irrelevant for unanswerable questions)."""
-    return search(question, k=1, threshold=None)[0]["similarity"], max(bm25_scores(question).values())
+    """Best similarity, BM25 score and generated-question similarity of any chunk
+    (all irrelevant for unanswerable questions)."""
+    qhits = question_search(embed_question(question), k=1)
+    return (search(question, k=1, threshold=None)[0]["similarity"], max(bm25_scores(question).values()),
+            qhits[0]["question_similarity"] if qhits else 0)
 
 
 if __name__ == "__main__":
@@ -89,7 +93,7 @@ if __name__ == "__main__":
         scores = answer_scores(question, needle)
         if scores:
             answers.append(scores)
-            print(f"  answer similarity={scores[0]:.3f}  bm25={scores[1]:5.1f}   {question}")
+            print(f"  answer similarity={scores[0]:.3f}  bm25={scores[1]:5.1f}  qsim={scores[2]:.3f}   {question}")
         else:
             print(f"  answer NOT RETRIEVED by vector top {K} or hybrid search    {question}")
 
@@ -98,19 +102,31 @@ if __name__ == "__main__":
     for question in CALIBRATION_UNANSWERABLE:
         scores = noise_scores(question)
         noise.append(scores)
-        print(f"  best similarity={scores[0]:.3f}  best bm25={scores[1]:5.1f}   {question}")
+        print(f"  best similarity={scores[0]:.3f}  best bm25={scores[1]:5.1f}  best qsim={scores[2]:.3f}   {question}")
 
     print(f"\nSimilarity threshold {config.SIMILARITY_THRESHOLD} combined with each keyword threshold:")
     print("  (a chunk is kept if similarity >= similarity threshold OR bm25 >= keyword threshold)")
     print("  keyword threshold | answer chunks kept | unanswerable questions with a kept chunk")
     for kt in [4, 6, 7, 8, 9, 10, 12, 15]:
-        kept = sum(s >= config.SIMILARITY_THRESHOLD or b >= kt for s, b in answers)
-        leaked = sum(s >= config.SIMILARITY_THRESHOLD or b >= kt for s, b in noise)
+        kept = sum(s >= config.SIMILARITY_THRESHOLD or b >= kt for s, b, _ in answers)
+        leaked = sum(s >= config.SIMILARITY_THRESHOLD or b >= kt for s, b, _ in noise)
         mark = "  <-- current" if kt == config.KEYWORD_SCORE_THRESHOLD else ""
         print(f"        {kt:>4}         |      {kept:>2}/{len(answers)}          |   {leaked}/{len(noise)}{mark}")
 
+    print(f"\nWith similarity {config.SIMILARITY_THRESHOLD} and keyword {config.KEYWORD_SCORE_THRESHOLD}, "
+          f"each generated-question threshold:")
+    print("  (a chunk is also kept if one of its generated questions reaches the question threshold)")
+    print("  question threshold | answer chunks kept | unanswerable questions with a kept chunk")
+    for qt in [0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]:
+        def passes(s, b, q):
+            return s >= config.SIMILARITY_THRESHOLD or b >= config.KEYWORD_SCORE_THRESHOLD or q >= qt
+        kept = sum(passes(*a) for a in answers)
+        leaked = sum(passes(*n) for n in noise)
+        mark = "  <-- current" if qt == config.QUESTION_SIMILARITY_THRESHOLD else ""
+        print(f"        {qt:.2f}        |      {kept:>2}/{len(answers)}          |   {leaked}/{len(noise)}{mark}")
+
     print(f"\nVALIDATION with current thresholds (similarity {config.SIMILARITY_THRESHOLD}, "
-          f"bm25 {config.KEYWORD_SCORE_THRESHOLD})")
+          f"bm25 {config.KEYWORD_SCORE_THRESHOLD}, question similarity {config.QUESTION_SIMILARITY_THRESHOLD})")
     for question, needle in VALIDATION_ANSWERABLE:
         kept = hybrid_search(question)
         ok = any(needle in c["text"] for c in kept)

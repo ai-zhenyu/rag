@@ -1,4 +1,5 @@
 """Ingestion pipeline: documents -> pages/sections -> chunks -> embeddings -> ChromaDB.
+A second collection holds questions each chunk answers, written by the chat model (reverse HyDE).
 
 Every PDF and Word (.docx) file in data/ is ingested; the collection is rebuilt from scratch on each run.
 PDF chunks are located by page; Word chunks by section (Word files have no fixed pages).
@@ -36,6 +37,20 @@ TABLE_DESCRIPTION_PROMPT = (
     '(e.g. "Inventories", not a generic heading); ignore any unrelated sentences above the table. Then '
     "say what the columns represent (e.g. reporting periods), and list EVERY row label so each one can be "
     "found by search. Do not quote any numbers. Do not invent anything.\n\n{table}"
+)
+
+# Reverse HyDE: questions each chunk answers. Half are worded like the document and half in plain words,
+# because users often don't know the document's terms. The example is deliberately not a benchmark topic.
+QUESTION_PROMPT = (
+    "Below is an excerpt from the document {source}. Write {n} different questions that a reader could ask "
+    "and that this excerpt fully answers.\n"
+    "- Each question must be answerable from the excerpt alone.\n"
+    "- Name the company or subject when the excerpt makes it clear.\n"
+    "- Word about half of the questions the way the excerpt does, and the rest in plain everyday words a "
+    'non-expert would use (e.g. "money the company owes its suppliers" for accounts payable).\n'
+    "- Cover the excerpt's different facts; for a table, ask about different rows.\n"
+    "- Write one question per line, with no numbering or other text.\n\n"
+    "Excerpt:\n{excerpt}"
 )
 
 
@@ -208,36 +223,66 @@ def describe_tables(chunks):
     Descriptions are cached in config.DESCRIPTION_CACHE: regenerating them gives slightly different
     wording each time, which moved the income statement from rank 4 to rank 6 between two ingests.
     """
-    load_dotenv()
-    client = OpenAI()
     tables = [c for c in chunks if c["type"] == "table"]
-    cache = _load_description_cache()
-    def key(chunk):
-        return hashlib.sha256(f"{config.CHAT_MODEL}\n{TABLE_DESCRIPTION_PROMPT}\n{chunk['text']}".encode()).hexdigest()
-
-    def describe(chunk):
-        response = client.chat.completions.create(
-            model=config.CHAT_MODEL, reasoning_effort=config.CHAT_REASONING_EFFORT,
-            messages=[{"role": "user", "content": TABLE_DESCRIPTION_PROMPT.format(table=chunk["text"])}],
-        )
-        cache[key(chunk)] = response.choices[0].message.content.strip()
-
-    missing = [c for c in tables if key(c) not in cache]
-    print(f"  {len(tables) - len(missing)} table descriptions reused from cache, {len(missing)} new")
-    with ThreadPoolExecutor(max_workers=8) as pool:  # 8 requests at a time instead of one by one
-        list(pool.map(describe, missing))
-    for c in tables:
-        c["description"] = cache[key(c)]
-    if missing:
-        config.DESCRIPTION_CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
+    replies = _cached_completions(tables, TABLE_DESCRIPTION_PROMPT, lambda c: {"table": c["text"]},
+                                  config.DESCRIPTION_CACHE, "table descriptions")
+    for c, reply in zip(tables, replies):
+        c["description"] = reply
     return chunks
 
 
-def _load_description_cache():
+def generate_questions(chunks):
+    """Add "questions": up to QUESTIONS_PER_CHUNK questions each chunk answers (reverse HyDE).
+
+    A user's question is usually closer in wording to another question than to the passage that
+    answers it, so retrieval also compares the user's question with these. Cached like descriptions.
+    """
+    def fields(c):
+        # Tables include their description; Word sections their headings, as in the embedding input
+        excerpt = embedding_input(c)
+        if c.get("section_titles"):
+            excerpt = f"Section: {c['section_titles']}\n{excerpt}"
+        return {"source": c["source"], "n": str(config.QUESTIONS_PER_CHUNK), "excerpt": excerpt}
+
+    replies = _cached_completions(chunks, QUESTION_PROMPT, fields, config.QUESTION_CACHE, "question sets")
+    for c, reply in zip(chunks, replies):
+        lines = (re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip() for line in reply.splitlines())
+        c["questions"] = [q for q in lines if q.endswith("?")][:config.QUESTIONS_PER_CHUNK]
+    return chunks
+
+
+def _cached_completions(chunks, template, fields, cache_path, label):
+    """Chat-model reply to template.format(**fields(chunk)) for every chunk, cached in cache_path.
+
+    Regenerating gives slightly different wording each time, which shifts search rankings (the income
+    statement moved from rank 4 to rank 6 between two ingests), so a reply is reused for as long as the
+    model, the prompt template and the filled-in fields are unchanged.
+    """
+    load_dotenv()
+    client = OpenAI()
     try:
-        return json.loads(config.DESCRIPTION_CACHE.read_text(encoding="utf-8"))
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        cache = {}
+
+    def key(chunk):
+        content = "\n".join(fields(chunk).values())
+        return hashlib.sha256(f"{config.CHAT_MODEL}\n{template}\n{content}".encode()).hexdigest()
+
+    def complete(chunk):
+        response = client.chat.completions.create(
+            model=config.CHAT_MODEL, reasoning_effort=config.CHAT_REASONING_EFFORT,
+            messages=[{"role": "user", "content": template.format(**fields(chunk))}],
+        )
+        cache[key(chunk)] = response.choices[0].message.content.strip()
+
+    missing = [c for c in chunks if key(c) not in cache]
+    print(f"  {len(chunks) - len(missing)} {label} reused from cache, {len(missing)} new")
+    with ThreadPoolExecutor(max_workers=8) as pool:  # 8 requests at a time instead of one by one
+        list(pool.map(complete, missing))
+    if missing:
+        cache_path.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
+    return [cache[key(c)] for c in chunks]
 
 
 def embedding_input(chunk):
@@ -247,16 +292,22 @@ def embedding_input(chunk):
 
 def embed_chunks(chunks):
     """Add an "embedding" (list of floats) to every chunk, sending chunks to OpenAI in batches."""
+    for chunk, embedding in zip(chunks, embed_texts([embedding_input(c) for c in chunks], "chunks")):
+        chunk["embedding"] = embedding
+    return chunks
+
+
+def embed_texts(texts, label):
+    """Embeddings for a list of texts, sent to OpenAI in batches."""
     load_dotenv()  # reads OPENAI_API_KEY from .env; the OpenAI client picks it up automatically
     client = OpenAI()
-    for i in range(0, len(chunks), config.EMBEDDING_BATCH_SIZE):
-        batch = chunks[i:i + config.EMBEDDING_BATCH_SIZE]
+    embeddings = []
+    for i in range(0, len(texts), config.EMBEDDING_BATCH_SIZE):
         response = client.embeddings.create(model=config.EMBEDDING_MODEL,
-                                            input=[embedding_input(c) for c in batch])
-        for chunk, item in zip(batch, response.data):
-            chunk["embedding"] = item.embedding
-        print(f"  embedded {i + len(batch)}/{len(chunks)} chunks")
-    return chunks
+                                            input=texts[i:i + config.EMBEDDING_BATCH_SIZE])
+        embeddings += [item.embedding for item in response.data]
+        print(f"  embedded {len(embeddings)}/{len(texts)} {label}")
+    return embeddings
 
 
 def store_chunks(chunks):
@@ -265,13 +316,7 @@ def store_chunks(chunks):
     Chroma record shape: text -> documents, embedding -> embeddings,
     n_tokens, page numbers and (for tables) the search description -> metadatas.
     """
-    client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
-    if config.COLLECTION_NAME in [c.name for c in client.list_collections()]:
-        client.delete_collection(config.COLLECTION_NAME)  # rebuild from scratch so re-runs don't duplicate
-    collection = client.create_collection(
-        name=config.COLLECTION_NAME,
-        configuration={"hnsw": {"space": "cosine"}},  # default would be "l2"
-    )
+    collection = _new_collection(config.COLLECTION_NAME)
     collection.add(
         ids=[c["id"] for c in chunks],
         documents=[c["text"] for c in chunks],
@@ -284,6 +329,27 @@ def store_chunks(chunks):
                    for c in chunks],
     )
     return collection
+
+
+def store_questions(chunks):
+    """(Re)create the question collection: one record per generated question, pointing to its chunk."""
+    records = [(f"{c['id']}/q{j}", q, c) for c in chunks for j, q in enumerate(c["questions"])]
+    embeddings = embed_texts([q for _, q, _ in records], "questions")
+    collection = _new_collection(config.QUESTION_COLLECTION_NAME)
+    for i in range(0, len(records), 1000):  # Chroma limits how many records one add() may contain
+        batch = records[i:i + 1000]
+        collection.add(ids=[id_ for id_, _, _ in batch], documents=[q for _, q, _ in batch],
+                       embeddings=embeddings[i:i + 1000],
+                       metadatas=[{"chunk_id": c["id"], "source": c["source"]} for _, _, c in batch])
+    return collection
+
+
+def _new_collection(name):
+    """An empty collection using cosine distance, replacing any existing one (re-runs don't duplicate)."""
+    client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
+    if name in [c.name for c in client.list_collections()]:
+        client.delete_collection(name)
+    return client.create_collection(name=name, configuration={"hnsw": {"space": "cosine"}})  # default: "l2"
 
 
 def dump_pages(pages, tables, path, label=lambda n: f"page {n}"):
@@ -507,3 +573,8 @@ if __name__ == "__main__":
     collection = store_chunks(chunks)
     print(f"Stored {collection.count()} chunks in {config.CHROMA_DIR} "
           f"(collection '{collection.name}', distance: {collection.configuration['hnsw']['space']})")
+
+    print(f"Generating {config.QUESTIONS_PER_CHUNK} questions per chunk with {config.CHAT_MODEL} (reverse HyDE)...")
+    generate_questions(chunks)
+    questions = store_questions(chunks)
+    print(f"Stored {questions.count()} questions (collection '{questions.name}')")

@@ -44,3 +44,17 @@ HYBRID_KEYWORD_K = 7  # best chunks taken from keyword search
 # no unanswerable question gets through that vector search didn't already let through (off-topic
 # noise reached 6.7). The margin is thin, so re-run calibrate.py after changing chunking or the PDF.
 KEYWORD_SCORE_THRESHOLD = 7.0
+
+# Reverse HyDE (version 3): during ingest the chat model writes questions that each chunk answers, and
+# those questions are embedded in a second collection. A user question is then also matched against
+# the generated questions (question-to-question), which bridges wording differences such as paraphrases.
+USE_QUESTION_INDEX = True
+QUESTIONS_PER_CHUNK = 5
+QUESTION_COLLECTION_NAME = "chunk_questions"
+QUESTION_CACHE = DATA_DIR / "chunk_questions.json"  # generated questions, reused on re-ingest like descriptions
+HYBRID_QUESTION_K = 5  # best chunks taken from the question index
+# A chunk is also kept if one of its generated questions is at least this similar to the user's question.
+# Chosen with calibrate.py: off-topic questions matched generated questions at most 0.50, answer chunks
+# scored 0.66-0.94. On-topic questions the document can't answer score high anyway (up to 0.87), as with
+# the other scores, so the answer prompt handles those.
+QUESTION_SIMILARITY_THRESHOLD = 0.55

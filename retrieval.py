@@ -2,7 +2,8 @@
 
 - search():        embedding (vector) search only, as in the assignment
 - keyword_search(): BM25 keyword search
-- hybrid_search(): both combined; this is what answer.py uses
+- question_search(): matches the question against questions generated for each chunk (reverse HyDE)
+- hybrid_search(): all three combined; this is what answer.py uses
 
 Run:  python retrieval.py "What was NVIDIA's revenue?"  [k]
 """
@@ -20,6 +21,7 @@ import config
 load_dotenv()  # reads OPENAI_API_KEY from .env
 _openai = OpenAI()
 _collection = None
+_question_collection = None
 _bm25 = None
 
 # Common words that carry no meaning for keyword matching.
@@ -34,6 +36,16 @@ def get_collection():
         client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
         _collection = client.get_collection(config.COLLECTION_NAME)
     return _collection
+
+
+def get_question_collection():
+    """The generated-questions collection, or None if ingest.py hasn't built it yet."""
+    global _question_collection
+    if _question_collection is None:
+        client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
+        if config.QUESTION_COLLECTION_NAME in [c.name for c in client.list_collections()]:
+            _question_collection = client.get_collection(config.QUESTION_COLLECTION_NAME)
+    return _question_collection
 
 
 def embed_question(question):
@@ -111,16 +123,54 @@ def keyword_search(question, k=config.HYBRID_KEYWORD_K, source=None, scores=None
     return [{**c, "bm25_score": scores[c["id"]]} for c in best]
 
 
-def _merge_hits(vector_hits, keyword_hits, question_embedding, scores):
-    """Interleave two rankings (vector #1, keyword #1, vector #2, ...), merge duplicates, and give
-    every chunk both scores, "found_by" and "kept"."""
+def question_search(question_embedding, k=config.HYBRID_QUESTION_K, source=None):
+    """Reverse HyDE: the k chunks whose generated questions best match the user's question.
+
+    Each result gets "question_similarity" (its best-matching generated question's similarity)
+    and "matched_question". Returns [] if the question collection doesn't exist.
+    """
+    collection = get_question_collection()
+    if collection is None:
+        return []
+    results = collection.query(  # several questions per chunk, so ask for more and keep each chunk's best
+        query_embeddings=[question_embedding], n_results=k * config.QUESTIONS_PER_CHUNK,
+        where={"source": source} if source else None, include=["documents", "metadatas", "distances"],
+    )
+    best = {}
+    for text, meta, dist in zip(results["documents"][0], results["metadatas"][0], results["distances"][0]):
+        best.setdefault(meta["chunk_id"], (1 - dist, text))  # results come most similar first
+    ids = list(best)[:k]
+    if not ids:
+        return []
+    data = get_collection().get(ids=ids, include=["documents", "metadatas"])
+    chunks = {c["id"]: c for c in _to_chunks(data["ids"], data["documents"], data["metadatas"])}
+    return [{**chunks[id_], "question_similarity": best[id_][0], "matched_question": best[id_][1]} for id_ in ids]
+
+
+def _question_similarities(ids, question_embedding):
+    """(best generated-question similarity, that question) for each chunk id; (None, None) without an index."""
+    best = {id_: (None, None) for id_ in ids}
+    collection = get_question_collection()
+    if collection is None or not ids:
+        return best
+    data = collection.get(where={"chunk_id": {"$in": ids}}, include=["embeddings", "metadatas", "documents"])
+    for meta, emb, text in zip(data["metadatas"], data["embeddings"], data["documents"]):
+        sim = float(sum(a * b for a, b in zip(question_embedding, emb)))
+        if best[meta["chunk_id"]][0] is None or sim > best[meta["chunk_id"]][0]:
+            best[meta["chunk_id"]] = (sim, text)
+    return best
+
+
+def _merge_hits(vector_hits, keyword_hits, question_hits, question_embedding, scores):
+    """Interleave the rankings (vector #1, keyword #1, question #1, vector #2, ...), merge duplicates,
+    and give every chunk all three scores, "found_by" and "kept"."""
     merged = {}
-    for pair in zip_longest(vector_hits, keyword_hits):
-        for hit in pair:
+    for hits in zip_longest(vector_hits, keyword_hits, question_hits):
+        for hit in hits:
             if hit:
                 merged.setdefault(hit["id"], {}).update(hit)
-    vector_ids = {c["id"] for c in vector_hits}
-    keyword_ids = {c["id"] for c in keyword_hits}
+    found = {"vector": {c["id"] for c in vector_hits}, "keyword": {c["id"] for c in keyword_hits},
+             "question": {c["id"] for c in question_hits}}
 
     missing_sim = [id_ for id_ in merged if "similarity" not in merged[id_]]
     if missing_sim:
@@ -129,29 +179,35 @@ def _merge_hits(vector_hits, keyword_hits, question_embedding, scores):
             # OpenAI embeddings have length 1, so cosine similarity is just the dot product.
             merged[id_]["similarity"] = float(sum(a * b for a, b in zip(question_embedding, emb)))
 
+    missing_q = [id_ for id_ in merged if "question_similarity" not in merged[id_]]
+    for id_, (sim, text) in _question_similarities(missing_q, question_embedding).items():
+        merged[id_]["question_similarity"], merged[id_]["matched_question"] = sim, text
+
     for id_, chunk in merged.items():
         chunk["bm25_score"] = scores[id_]
-        chunk["found_by"] = "both" if id_ in vector_ids and id_ in keyword_ids else (
-            "vector" if id_ in vector_ids else "keyword")
+        chunk["found_by"] = "+".join(name for name, ids in found.items() if id_ in ids)
+        qsim = chunk["question_similarity"]
         chunk["kept"] = (chunk["similarity"] >= config.SIMILARITY_THRESHOLD
-                         or chunk["bm25_score"] >= config.KEYWORD_SCORE_THRESHOLD)
+                         or chunk["bm25_score"] >= config.KEYWORD_SCORE_THRESHOLD
+                         or (qsim is not None and qsim >= config.QUESTION_SIMILARITY_THRESHOLD))
     return list(merged.values())
 
 
-def hybrid_search(question, apply_thresholds=True):
-    """Vector + keyword search, run separately for every document, results merged.
+def hybrid_search(question, apply_thresholds=True, use_questions=config.USE_QUESTION_INDEX):
+    """Vector + keyword + generated-question search, run separately for every document, results merged.
 
     Vector search finds the same meaning in different words; keyword search finds exact names,
     numbers and rare terms that vector search can miss. Searching each document separately gives
     every document a fair chance: searched together, "Compare NVIDIA's and AMD's revenue"
     returned only NVIDIA chunks in the top 5 (AMD's revenue chunk ranked #33).
 
-    A chunk is kept if its similarity reaches SIMILARITY_THRESHOLD or its BM25 score reaches
-    KEYWORD_SCORE_THRESHOLD, so documents with nothing relevant contribute nothing. Results are
-    grouped by document, the best-matching document first.
+    A chunk is kept if its similarity reaches SIMILARITY_THRESHOLD, its BM25 score reaches
+    KEYWORD_SCORE_THRESHOLD, or one of its generated questions reaches QUESTION_SIMILARITY_THRESHOLD,
+    so documents with nothing relevant contribute nothing. Results are grouped by document, the
+    best-matching document first. use_questions=False gives version 2 (vector + keyword only).
 
-    Every result has "similarity", "bm25_score", "found_by" ("vector", "keyword" or "both")
-    and "kept". With apply_thresholds=False all candidates are returned (evaluate.py shows them).
+    Every result has "similarity", "bm25_score", "question_similarity", "matched_question",
+    "found_by" (e.g. "vector+keyword") and "kept". With apply_thresholds=False all candidates are returned (evaluate.py shows them).
     """
     question_embedding = embed_question(question)
     scores = bm25_scores(question)
@@ -162,7 +218,8 @@ def hybrid_search(question, apply_thresholds=True):
         vector_hits = search(question, k=config.HYBRID_VECTOR_K, threshold=None,
                              question_embedding=question_embedding, source=source)
         keyword_hits = keyword_search(question, source=source, scores=scores)
-        group = _merge_hits(vector_hits, keyword_hits, question_embedding, scores)
+        question_hits = question_search(question_embedding, source=source) if use_questions else []
+        group = _merge_hits(vector_hits, keyword_hits, question_hits, question_embedding, scores)
         if apply_thresholds:
             group = [c for c in group if c["kept"]]
         if group:
@@ -197,10 +254,12 @@ if __name__ == "__main__":
         print(f"#{rank:<2} {status} similarity={chunk['similarity']:.4f} (distance={chunk['distance']:.4f})  "
               f"{format_source(chunk):<24} {chunk['type']:<5}  {preview}")
 
-    print(f"\nHYBRID SEARCH: top {config.HYBRID_VECTOR_K} vector + top {config.HYBRID_KEYWORD_K} keyword "
-          f"(kept if similarity >= {config.SIMILARITY_THRESHOLD} or BM25 >= {config.KEYWORD_SCORE_THRESHOLD})")
+    print(f"\nHYBRID SEARCH: top {config.HYBRID_VECTOR_K} vector + top {config.HYBRID_KEYWORD_K} keyword + "
+          f"top {config.HYBRID_QUESTION_K} generated-question (kept if similarity >= {config.SIMILARITY_THRESHOLD}, "
+          f"BM25 >= {config.KEYWORD_SCORE_THRESHOLD} or question similarity >= {config.QUESTION_SIMILARITY_THRESHOLD})")
     for chunk in hybrid_search(question, apply_thresholds=False):
         status = "kept   " if chunk["kept"] else "DROPPED"
-        preview = " ".join(chunk["text"].split())[:100]
-        print(f"{status} sim={chunk['similarity']:.3f} bm25={chunk['bm25_score']:5.1f} by {chunk['found_by']:<7} "
-              f"{format_source(chunk):<24} {chunk['type']:<5}  {preview}")
+        qsim = chunk["question_similarity"]
+        print(f"{status} sim={chunk['similarity']:.3f} bm25={chunk['bm25_score']:5.1f} "
+              f"qsim={'-' if qsim is None else f'{qsim:.3f}'} by {chunk['found_by']:<23} "
+              f"{format_source(chunk):<24} {chunk['type']:<5}\n        matched question: {chunk['matched_question']}")

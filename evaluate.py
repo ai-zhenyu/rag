@@ -52,7 +52,9 @@ QUESTIONS = [
 def print_chunks(chunks, full):
     for rank, c in enumerate(chunks, start=1):
         status = "kept   " if c["kept"] else "dropped"
-        keyword = f"  bm25={c['bm25_score']:5.1f}  by {c['found_by']:<7}" if "bm25_score" in c else ""
+        qsim = c.get("question_similarity")
+        keyword = (f"  bm25={c['bm25_score']:5.1f}  qsim={'-' if qsim is None else f'{qsim:.3f}'}"
+                   f"  by {c['found_by']:<23}") if "bm25_score" in c else ""
         text = c["text"] if full else " ".join(c["text"].split())[:120] + "..."
         print(f"  #{rank:<2} {status} similarity={c['similarity']:.3f}{keyword}  {format_source(c):<24} "
               f"{c['type']:<5}  {text}")
@@ -69,8 +71,10 @@ if __name__ == "__main__":
     if vector_only:
         print(f"Mode: VECTOR ONLY (v1): top_k={config.TOP_K}, similarity threshold={config.SIMILARITY_THRESHOLD}")
     else:
-        print(f"Mode: HYBRID (v2): top {config.HYBRID_VECTOR_K} vector + top {config.HYBRID_KEYWORD_K} keyword, "
-              f"kept if similarity >= {config.SIMILARITY_THRESHOLD} or BM25 >= {config.KEYWORD_SCORE_THRESHOLD}")
+        print(f"Mode: HYBRID + GENERATED QUESTIONS (v3): top {config.HYBRID_VECTOR_K} vector + "
+              f"top {config.HYBRID_KEYWORD_K} keyword + top {config.HYBRID_QUESTION_K} generated-question, "
+              f"kept if similarity >= {config.SIMILARITY_THRESHOLD}, BM25 >= {config.KEYWORD_SCORE_THRESHOLD} "
+              f"or question similarity >= {config.QUESTION_SIMILARITY_THRESHOLD}")
     print(f"Models: embedding={config.EMBEDDING_MODEL}, chat={config.CHAT_MODEL}")
 
     for n in selected:

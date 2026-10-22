@@ -9,8 +9,9 @@ Generation (judged by a separate, stronger model):
   faithful    - every factual claim is supported by the retrieved excerpts
   citation    - at least one cited page is a page where the answer appears
 
-Run:  python benchmark.py                # hybrid search (v2)
-      python benchmark.py --vector-only  # vector search only (v1), for comparison
+Run:  python benchmark.py                 # hybrid search with generated questions (v3)
+      python benchmark.py --no-questions  # vector + keyword only (v2), for comparison
+      python benchmark.py --vector-only   # vector search only (v1), for comparison
       python benchmark.py --category adversarial   # one category only
 """
 import json
@@ -81,10 +82,10 @@ def evidence_pages(evidence, source):
     return {(source, page) for page, text in page_texts(source).items() if any(e in text for e in evidence)}
 
 
-def retrieve(question, vector_only):
-    if vector_only:
+def retrieve(question, mode):
+    if mode == "v1":
         return search(question)  # threshold applied
-    return hybrid_search(question)
+    return hybrid_search(question, use_questions=mode == "v3")
 
 
 def judge(item, answer_text, chunks):
@@ -111,8 +112,8 @@ def judge(item, answer_text, chunks):
     raise RuntimeError("judge still rate-limited after 5 minutes")
 
 
-def retrieve_and_answer(item, vector_only):
-    chunks = retrieve(item["question"], vector_only)
+def retrieve_and_answer(item, mode):
+    chunks = retrieve(item["question"], mode)
     if "inject" in item:  # indirect prompt injection test: a fake excerpt with planted instructions
         fake = {"text": item["inject"], "page_start": 30, "page_end": 30, "type": "text",
                 "source": item.get("source", DEFAULT_SOURCE)}
@@ -122,6 +123,7 @@ def retrieve_and_answer(item, vector_only):
 
 def score(item, chunks, answer_text, verdict):
     result = {**item, "answer": answer_text, "n_chunks": len(chunks),
+              "context_tokens": sum(c.get("n_tokens", 0) for c in chunks),
               "correct": bool(verdict.get("correct")), "faithful": bool(verdict.get("faithful")),
               "reason": verdict.get("reason", "")}
     if item["evidence"]:
@@ -136,19 +138,19 @@ def score(item, chunks, answer_text, verdict):
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    vector_only = "--vector-only" in sys.argv
+    mode = "v1" if "--vector-only" in sys.argv else "v2" if "--no-questions" in sys.argv else "v3"
     items = json.load(open(config.PROJECT_DIR / "eval_set.json", encoding="utf-8"))
     if "--category" in sys.argv:
         wanted = sys.argv[sys.argv.index("--category") + 1]
         items = [i for i in items if i["category"] == wanted]
 
-    mode = "VECTOR ONLY (v1)" if vector_only else "HYBRID (v2)"
-    print(f"Mode: {mode} | answer model: {config.CHAT_MODEL} | judge: {JUDGE_MODEL} | {len(items)} questions\n")
+    label = {"v1": "VECTOR ONLY (v1)", "v2": "HYBRID (v2)", "v3": "HYBRID + GENERATED QUESTIONS (v3)"}[mode]
+    print(f"Mode: {label} | answer model: {config.CHAT_MODEL} | judge: {JUDGE_MODEL} | {len(items)} questions\n")
 
     # Phase 1: retrieve and answer, several questions at a time (the answer model has high rate limits).
-    retrieve("warm-up", vector_only)  # build the Chroma client and BM25 index once before using threads
+    retrieve("warm-up", mode)  # build the Chroma client and BM25 index once before using threads
     with ThreadPoolExecutor(max_workers=6) as pool:
-        answered = list(pool.map(lambda item: retrieve_and_answer(item, vector_only), items))
+        answered = list(pool.map(lambda item: retrieve_and_answer(item, mode), items))
 
     # Phase 2: judge one at a time, waiting out rate limits.
     results = []
@@ -178,7 +180,7 @@ if __name__ == "__main__":
     pct = lambda n, d: f"{n}/{d} ({100 * n / d:.0f}%)"
 
     print("\n" + "=" * 70)
-    print(f"SUMMARY ({mode})")
+    print(f"SUMMARY ({label})")
     if answerable:
         print(f"  Answerable ({len(answerable)}):")
         print(f"    recall (answer chunk sent to LLM): {pct(sum(r['rank'] is not None for r in answerable), len(answerable))}")
@@ -193,6 +195,11 @@ if __name__ == "__main__":
         print(f"  Adversarial ({len(adversarial)}):")
         print(f"    handled safely:                    {pct(sum(r['correct'] for r in adversarial), len(adversarial))}")
     print(f"  All questions: faithful (no unsupported claims): {pct(sum(r['faithful'] for r in results), len(results))}")
+    sent = [r for r in results if r["n_chunks"]]
+    if sent:
+        print(f"  Context sent to the answer model (questions with any chunks): "
+              f"avg {sum(r['n_chunks'] for r in sent) / len(sent):.1f} chunks, "
+              f"{sum(r['context_tokens'] for r in sent) / len(sent):,.0f} tokens")
 
     print("\n  By category:   n   recall   correct")
     by_cat = defaultdict(list)
