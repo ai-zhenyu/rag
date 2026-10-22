@@ -9,7 +9,8 @@ Generation (judged by a separate, stronger model):
   faithful    - every factual claim is supported by the retrieved excerpts
   citation    - at least one cited page is a page where the answer appears
 
-Run:  python benchmark.py                 # hybrid search with generated questions (v3)
+Run:  python benchmark.py                 # hybrid search with generated questions, re-ranked (v4)
+      python benchmark.py --no-rerank     # hybrid search with generated questions (v3), for comparison
       python benchmark.py --no-questions  # vector + keyword only (v2), for comparison
       python benchmark.py --vector-only   # vector search only (v1), for comparison
       python benchmark.py --category adversarial   # one category only
@@ -27,7 +28,7 @@ from openai import OpenAI, RateLimitError
 
 import config
 from answer import EMPTY, NOT_FOUND, TOO_LONG, answer, build_context, citations
-from retrieval import hybrid_search, search
+from retrieval import hybrid_search, rerank, search
 
 JUDGE_MODEL = "gpt-6.1-sol"  # stronger than the answering model, so it isn't grading its own work
 JUDGE_REASONING_EFFORT = "low"  # the lowest this model allows
@@ -83,9 +84,13 @@ def evidence_pages(evidence, source):
 
 
 def retrieve(question, mode):
+    """(chunks, tokens used by the re-ranker)."""
     if mode == "v1":
-        return search(question)  # threshold applied
-    return hybrid_search(question, use_questions=mode == "v3")
+        return search(question), 0  # threshold applied
+    chunks = hybrid_search(question, use_questions=mode in ("v3", "v4"))
+    if mode == "v4" and chunks:
+        return rerank(question, chunks)
+    return chunks, 0
 
 
 def judge(item, answer_text, chunks):
@@ -113,16 +118,16 @@ def judge(item, answer_text, chunks):
 
 
 def retrieve_and_answer(item, mode):
-    chunks = retrieve(item["question"], mode)
+    chunks, rerank_tokens = retrieve(item["question"], mode)
     if "inject" in item:  # indirect prompt injection test: a fake excerpt with planted instructions
         fake = {"text": item["inject"], "page_start": 30, "page_end": 30, "type": "text",
                 "source": item.get("source", DEFAULT_SOURCE)}
         chunks = chunks[:2] + [fake] + chunks[2:]
-    return chunks, answer(item["question"], chunks)
+    return chunks, answer(item["question"], chunks), rerank_tokens
 
 
-def score(item, chunks, answer_text, verdict):
-    result = {**item, "answer": answer_text, "n_chunks": len(chunks),
+def score(item, chunks, answer_text, verdict, rerank_tokens=0):
+    result = {**item, "answer": answer_text, "n_chunks": len(chunks), "rerank_tokens": rerank_tokens,
               "context_tokens": sum(c.get("n_tokens", 0) for c in chunks),
               "correct": bool(verdict.get("correct")), "faithful": bool(verdict.get("faithful")),
               "reason": verdict.get("reason", "")}
@@ -138,13 +143,15 @@ def score(item, chunks, answer_text, verdict):
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    mode = "v1" if "--vector-only" in sys.argv else "v2" if "--no-questions" in sys.argv else "v3"
+    mode = ("v1" if "--vector-only" in sys.argv else "v2" if "--no-questions" in sys.argv
+            else "v3" if "--no-rerank" in sys.argv else "v4")
     items = json.load(open(config.PROJECT_DIR / "eval_set.json", encoding="utf-8"))
     if "--category" in sys.argv:
         wanted = sys.argv[sys.argv.index("--category") + 1]
         items = [i for i in items if i["category"] == wanted]
 
-    label = {"v1": "VECTOR ONLY (v1)", "v2": "HYBRID (v2)", "v3": "HYBRID + GENERATED QUESTIONS (v3)"}[mode]
+    label = {"v1": "VECTOR ONLY (v1)", "v2": "HYBRID (v2)", "v3": "HYBRID + GENERATED QUESTIONS (v3)",
+             "v4": "HYBRID + GENERATED QUESTIONS + RE-RANKING (v4)"}[mode]
     print(f"Mode: {label} | answer model: {config.CHAT_MODEL} | judge: {JUDGE_MODEL} | {len(items)} questions\n")
 
     # Phase 1: retrieve and answer, several questions at a time (the answer model has high rate limits).
@@ -154,9 +161,9 @@ if __name__ == "__main__":
 
     # Phase 2: judge one at a time, waiting out rate limits.
     results = []
-    for n, (item, (chunks, answer_text)) in enumerate(zip(items, answered), start=1):
+    for n, (item, (chunks, answer_text, rerank_tokens)) in enumerate(zip(items, answered), start=1):
         print(f"\rjudging {n}/{len(items)}...", end="", flush=True)
-        results.append(score(item, chunks, answer_text, judge(item, answer_text, chunks)))
+        results.append(score(item, chunks, answer_text, judge(item, answer_text, chunks), rerank_tokens))
     print("\r" + " " * 30 + "\r", end="")
 
     for r in results:
@@ -190,7 +197,7 @@ if __name__ == "__main__":
     if unanswerable:
         print(f"  Unanswerable ({len(unanswerable)}):")
         print(f"    correctly declined:                {pct(sum(r['correct'] for r in unanswerable), len(unanswerable))}")
-        print(f"    of which blocked by thresholds:    {sum(r['n_chunks'] == 0 for r in unanswerable)}")
+        print(f"    of which no chunk was sent:        {sum(r['n_chunks'] == 0 for r in unanswerable)}")
     if adversarial:
         print(f"  Adversarial ({len(adversarial)}):")
         print(f"    handled safely:                    {pct(sum(r['correct'] for r in adversarial), len(adversarial))}")
@@ -200,6 +207,8 @@ if __name__ == "__main__":
         print(f"  Context sent to the answer model (questions with any chunks): "
               f"avg {sum(r['n_chunks'] for r in sent) / len(sent):.1f} chunks, "
               f"{sum(r['context_tokens'] for r in sent) / len(sent):,.0f} tokens")
+    if mode == "v4":
+        print(f"  Re-ranker call: avg {sum(r['rerank_tokens'] for r in results) / len(results):,.0f} tokens per question")
 
     print("\n  By category:   n   recall   correct")
     by_cat = defaultdict(list)

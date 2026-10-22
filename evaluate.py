@@ -11,7 +11,7 @@ import sys
 
 import config
 from answer import answer
-from retrieval import format_source, hybrid_search, search
+from retrieval import format_source, hybrid_search, rerank, search
 
 # (question, what it tests, expected answer taken from the PDF)
 QUESTIONS = [
@@ -71,10 +71,11 @@ if __name__ == "__main__":
     if vector_only:
         print(f"Mode: VECTOR ONLY (v1): top_k={config.TOP_K}, similarity threshold={config.SIMILARITY_THRESHOLD}")
     else:
-        print(f"Mode: HYBRID + GENERATED QUESTIONS (v3): top {config.HYBRID_VECTOR_K} vector + "
+        print(f"Mode: HYBRID + GENERATED QUESTIONS + RE-RANKING (v4): top {config.HYBRID_VECTOR_K} vector + "
               f"top {config.HYBRID_KEYWORD_K} keyword + top {config.HYBRID_QUESTION_K} generated-question, "
               f"kept if similarity >= {config.SIMILARITY_THRESHOLD}, BM25 >= {config.KEYWORD_SCORE_THRESHOLD} "
-              f"or question similarity >= {config.QUESTION_SIMILARITY_THRESHOLD}")
+              f"or question similarity >= {config.QUESTION_SIMILARITY_THRESHOLD}"
+              + (f"; re-ranker keeps up to {config.RERANK_KEEP}" if config.USE_RERANKER else ""))
     print(f"Models: embedding={config.EMBEDDING_MODEL}, chat={config.CHAT_MODEL}")
 
     for n in selected:
@@ -93,6 +94,9 @@ if __name__ == "__main__":
         kept = [c for c in retrieved if c["kept"]]
         print(f"\nRetrieved chunks ({len(kept)} of {len(retrieved)} pass the threshold):")
         print_chunks(retrieved, full)
+        if not vector_only and config.USE_RERANKER and kept:
+            kept, _ = rerank(question, kept)
+            print(f"\nRe-ranker kept {len(kept)}: " + ", ".join(f"{format_source(c)} ({c['type']})" for c in kept))
 
         print(f"\nANSWER:   {answer(question, kept)}")
         print(f"EXPECTED: {expected}")

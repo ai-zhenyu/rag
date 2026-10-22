@@ -58,3 +58,12 @@ HYBRID_QUESTION_K = 5  # best chunks taken from the question index
 # scored 0.66-0.94. On-topic questions the document can't answer score high anyway (up to 0.87), as with
 # the other scores, so the answer prompt handles those.
 QUESTION_SIMILARITY_THRESHOLD = 0.55
+
+# Re-ranking (version 4): the chat model reads the question with every kept candidate (about 16) and keeps
+# the most useful ones. The searches score chunks one signal at a time; the re-ranker reads question and
+# chunk together, and the answer model then gets fewer, better chunks.
+USE_RERANKER = True
+RERANK_KEEP = 7             # chunks passed on to the answer model
+# Each candidate is shortened to this for the re-ranker. 700 fits a whole chunk plus its table description:
+# at 300 the re-ranker missed answers that sat past token 350 of their chunk (benchmark #12, #21).
+RERANK_PREVIEW_TOKENS = 700

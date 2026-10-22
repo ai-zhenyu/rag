@@ -8,8 +8,8 @@ PDF ──► extract (unstructured + pdfplumber) ──► chunk (tiktoken) ─
                                                   └─► generate 5 questions per chunk ──► ChromaDB (questions)
 
 question ──┬─► vector search (top 7) ─────────┐
-           ├─► keyword search (top 7) ────────┼─► thresholds ──► gpt-6-luna ──► answer + pages
-           └─► generated-question search (top 5) ┘
+           ├─► keyword search (top 7) ────────┼─► thresholds ──► re-rank (gpt-6-luna) ──► gpt-6-luna ──► answer + pages
+           └─► generated-question search (top 5) ┘    (~16 chunks)        (keeps ≤ 7, usually 2)
 ```
 
 ## Setup (Windows)
@@ -37,7 +37,7 @@ With the venv active:
 | `python retrieval.py "your question" [k]` | Steps 6-7: show the top k vector-search chunks with similarity scores, then the hybrid-search chunks with similarity and BM25 scores, and whether each passes the thresholds. |
 | `python answer.py "your question"` | Step 8: answer the question from the document, citing pages. |
 | `python evaluate.py` | Step 9: run 10 test questions, printing retrieved chunks, scores, the answer and the expected answer. `python evaluate.py 1 7` runs selected questions; `--full` prints whole chunks; `--vector-only` runs version 1 (no keyword search) for comparison. |
-| `python benchmark.py` | Runs the 48 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--no-questions` scores version 2 and `--vector-only` version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
+| `python benchmark.py` | Runs the 48 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--no-rerank` scores version 3, `--no-questions` version 2 and `--vector-only` version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
 | `python calibrate.py` | Measures similarity and BM25 scores for answerable vs. unanswerable questions (used to choose both thresholds), then checks the thresholds on separate validation questions. |
 
 Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `config.py`.
@@ -65,6 +65,7 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 - **Threshold = 0.50, TOP_K = 10**, chosen with `calibrate.py` rather than the suggested 0.6: chunks containing the answer scored 0.49-0.72, off-topic and other-company questions at most 0.44. At 0.6 the correct R&D chunk (0.595) would be dropped. On-topic questions the document can't answer (e.g. revenue in fiscal 2027, 0.68) score as high as real answers; no threshold separates them, so the answer prompt handles those.
 - **Hybrid search (version 2):** vector search misses exact terms buried in a chunk about other topics and small tables (the inventory table ranked #44). BM25 keyword search (`rank_bm25`) ranks chunks by shared words, weighting rare words like "Blackwell" more. `hybrid_search()` takes the top 7 from each and merges duplicates (5 at first; raised to 7 when NVIDIA's income statement slipped to rank 6 in both searches and fell out of the context). Standard Reciprocal Rank Fusion was tested but left the inventory table at #13, outside the context. A chunk is kept if its similarity is >= 0.50 **or** its BM25 score is >= 7. That keyword threshold was chosen with `calibrate.py`: at 7 all 14 calibration answers are kept and no unanswerable question gets through that vector search didn't already let through. The margin is thin (off-topic noise reached 6.7, the weakest answer 7.6). After the table descriptions were rewritten by `gpt-6-luna` the margin is gone (an off-topic question scores 7.6, the weakest answer 7.1); 7 was kept because the answer prompt declines such questions.
 - **Generated questions, "reverse HyDE" (version 3):** a user's question is usually worded more like another question than like the passage that answers it. During ingest, `gpt-6-luna` writes 5 questions per chunk (about half in the document's wording, half in plain words, e.g. "money owed to suppliers" for accounts payable), cached in `data/chunk_questions.json` like the descriptions. They are embedded in a second collection, `chunk_questions` (1,600 questions for 320 chunks). `hybrid_search()` also takes the 5 chunks whose generated questions best match the user's question, and keeps a chunk whose best generated question reaches similarity **0.55**. Calibration: off-topic questions matched generated questions at most 0.50, answer chunks scored 0.66-0.94. "How much stock was sitting in NVIDIA's warehouses?", which failed validation in every earlier version, now finds the inventory table through the generated question "How much money did NVIDIA have tied up in all inventories?". Cost: one chat call per chunk at ingest (cached afterwards), one extra Chroma query per document per question, and about 14% more context tokens per answer.
+- **Re-ranking (version 4):** the three searches each score a chunk on one signal, and none reads the question and the chunk together, so about 16 chunks pass the thresholds and the answer model has to read past most of them (#24 had its answer at rank 4 and still refused). `rerank()` sends the question and every kept candidate to `gpt-6-luna`, which returns the ids of at most 7 useful ones as JSON; usually it keeps 1-3. The thresholds still decide whether anything is relevant at all; the re-ranker can also keep nothing, and then the answer model isn't called (9 of 10 unanswerable questions). Candidates are fenced and escaped like the answer prompt's excerpts, and only valid candidate ids are accepted. Candidates were first shortened to 300 tokens, but answers past token 350 of their chunk were then invisible (#12, #21); they are now shown whole (cap 700 tokens). The model sometimes writes ids as strings ("4"), which the parser accepts. Cost: about 6,900 tokens and 1 s per question for the re-ranker call, while the answer model's context drops from about 6,500 to about 700 tokens.
 - **Answering:** `gpt-6-luna` with `reasoning_effort="low"` (it rejects `temperature=0`, so wording can vary slightly between runs), instructed to use only the excerpts, cite pages, and otherwise reply with a fixed "not in the document" message. If no chunk passes the threshold the model is not called. Excerpts are labelled only with their page (`=== Excerpt from p. 3 (table) ===`); with numbered labels like `[Source 4 | p. 3]` the model cited the wrong page.
 
 ## Multiple PDFs
@@ -142,16 +143,17 @@ Limitations: no prompt defence is complete. The output check can't catch injecte
 
 48 questions in `eval_set.json` (39 at first; 9 adversarial added later): 29 answerable (8 using the document's wording, 16 deliberately paraphrased, 5 "why"/comparison) and 10 unanswerable (off-topic, other companies, and on-topic facts the filing doesn't contain, including a trap: it mentions expected Q4 Blackwell revenue but no total Q4 revenue).
 
-| Metric | v1 vector | v2 hybrid | v2, new models | v2, new models (re-run) | v3 generated questions |
-|---|---|---|---|---|---|
-| Recall (answer chunk sent to the LLM) | 21/29 (72%) | 24/29 (83%) | 24/29 (83%) | 25/29 (86%) | **27/29 (93%)** |
-| MRR | 0.55 | 0.60 | 0.61 | 0.63 | **0.66** |
-| Correct | 22/29 (76%) | **23/29 (79%)** | 21/29 (72%) | **23/29 (79%)** | **23/29 (79%)** |
-| Citation includes a right page | 20/29 (69%) | 21/29 (72%) | 19/29 (66%) | 21/29 (72%) | **24/29 (83%)** |
-| Unanswerable correctly declined | 10/10 | 10/10 | 9/10 | 9/10 | 9/10 |
-| Adversarial handled safely | - | - | 9/9 | 9/9 | 9/9 |
-| Faithful (no unsupported claims) | 39/39 | 39/39 | 48/48 | 48/48 | 48/48 |
-| Context per answered question | - | - | - | 13.8 chunks, 5,680 tokens | 16.1 chunks, 6,471 tokens |
+| Metric | v1 vector | v2 hybrid | v2, new models | v2, new models (re-run) | v3 generated questions | v4 re-ranked (300-token previews) | v4 re-ranked |
+|---|---|---|---|---|---|---|---|
+| Recall (answer chunk sent to the LLM) | 21/29 (72%) | 24/29 (83%) | 24/29 (83%) | 25/29 (86%) | **27/29 (93%)** | 25/29 (86%) | 26/29 (90%) |
+| MRR | 0.55 | 0.60 | 0.61 | 0.63 | 0.66 | 0.81 | **0.86** |
+| Correct | 22/29 (76%) | 23/29 (79%) | 21/29 (72%) | 23/29 (79%) | 23/29 (79%) | 24/29 (83%) | **26/29 (90%)** |
+| Citation includes a right page | 20/29 (69%) | 21/29 (72%) | 19/29 (66%) | 21/29 (72%) | **24/29 (83%)** | **24/29 (83%)** | 23/29 (79%) |
+| Unanswerable correctly declined | 10/10 | 10/10 | 9/10 | 9/10 | 9/10 | 9/10 | 9/10 |
+| Adversarial handled safely | - | - | 9/9 | 9/9 | 9/9 | 9/9 | 9/9 |
+| Faithful (no unsupported claims) | 39/39 | 39/39 | 48/48 | 48/48 | 48/48 | 48/48 | 47/48 |
+| Context per answered question | - | - | - | 13.8 chunks, 5,680 tokens | 16.1 chunks, 6,471 tokens | 1.8 chunks, 701 tokens | 1.9 chunks, 714 tokens |
+| Re-ranker call per question | - | - | - | - | - | 4,840 tokens | 6,931 tokens |
 
 The first two columns used `gpt-4o-mini` to answer and `gpt-4o` to judge, with 5 + 5 candidates. "v2, new models" uses
 `gpt-6-luna` / `gpt-6.1-sol`, 7 + 7 candidates, table descriptions rewritten by `gpt-6-luna`, and AMD's 10-Q and a
@@ -160,6 +162,18 @@ homework PDF ingested alongside NVIDIA's.
 The last two columns were run back to back with the same models and index, so they compare v2 and v3 fairly.
 The two v2 runs with new models differ only by run-to-run variation (answers and judging aren't deterministic;
 the index was rebuilt in between, with the same cached descriptions).
+
+What re-ranking (v4) changed, compared with v3:
+- **Correct 23 → 26 of 29 (90%), the best result so far; MRR 0.66 → 0.86.** The answer chunk is now usually the
+  first excerpt, and the answer model reads about 2 chunks instead of 16. #24 (answer at rank 4, refused in v3) is fixed.
+- **Recall is lower than v3 (26 vs 27):** the re-ranker can drop a chunk that contains the answer. Recall here means
+  "sent to the answer model", so it now measures the re-ranker as well as the searches.
+- **Tokens:** about 7,600 per question in total (6,900 re-ranker + 700 context, plus prompts), compared with about
+  6,500 context tokens in v3, all on `gpt-6-luna`. 9 of 10 unanswerable questions skip the answer call entirely.
+- **Faithfulness 47/48:** #18 has the right amount but calls July 28, 2024 the end of the fiscal year instead of the
+  six-month period.
+- **Remaining failures:** #6 and #25 are never retrieved (paraphrases: query rewriting would target them), #7 is the
+  judge's "omitted detail" rule, and #34 is the stale test.
 
 What generated questions (v3) changed, compared with the v2 re-run:
 - **Retrieval improved clearly:** recall 25 → 27 of 29 and citations 21 → 24. #16 ("ratio shares were divided") is now

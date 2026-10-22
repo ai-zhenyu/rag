@@ -17,7 +17,7 @@ import unicodedata
 from openai import OpenAI
 
 import config
-from retrieval import format_source, hybrid_search
+from retrieval import escape_tags as _escape, format_source, retrieve
 
 NOT_FOUND = "The document doesn't contain the answer to this question."
 TOO_LONG = f"Please ask a shorter question (at most {config.MAX_QUESTION_CHARS} characters)."
@@ -63,11 +63,6 @@ def clean_question(question):
     """
     visible = "".join(" " if unicodedata.category(ch) in ("Cc", "Cf") else ch for ch in question)
     return " ".join(visible.split())
-
-
-def _escape(text):
-    """Neutralise angle brackets so untrusted text can't close our tags (e.g. "</question>")."""
-    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def build_context(chunks):
@@ -131,7 +126,7 @@ def answer_with_details(question, chunks=None):
         return {"answer": TOO_LONG, "raw": None, "blocked": "question too long"}
 
     if chunks is None:
-        chunks = hybrid_search(question)
+        chunks = retrieve(question)
     if not chunks:
         return {"answer": NOT_FOUND, "raw": None, "blocked": None}
 
@@ -154,7 +149,7 @@ def answer(question, chunks=None):
     """Answer the question from the document only, citing page numbers.
 
     `chunks` can be passed in when they were already retrieved (evaluate.py does this to
-    print them); otherwise hybrid_search() is called. If no chunk passes the thresholds,
+    print them); otherwise retrieve() is called. If no chunk passes the thresholds,
     the model isn't called at all.
     """
     return answer_with_details(question, chunks)["answer"]
