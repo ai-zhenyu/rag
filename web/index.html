@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Document Q&amp;A</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M8 1l7 7-7 7-7-7z' fill='%232f5bd3'/></svg>">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">◆</span>
+        <div>
+          <div class="brand-name">Document Q&amp;A</div>
+          <div class="brand-sub" id="brand-sub">Retrieval-augmented answers with citations</div>
+        </div>
+      </div>
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="ask" role="tab">Ask</button>
+        <button class="tab" data-tab="docs" role="tab">Documents</button>
+        <button class="tab" data-tab="eval" role="tab">Evaluation</button>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <!-- ASK -->
+    <section id="tab-ask" class="tab-panel">
+      <form id="ask-form" class="card ask-card">
+        <label for="question" class="visually-hidden">Question</label>
+        <textarea id="question" rows="2" placeholder="Ask a question about the documents…" autofocus></textarea>
+        <div class="ask-footer">
+          <span class="hint">Enter to ask · Shift+Enter for a new line · <span id="char-count">0</span>/<span id="char-max">500</span></span>
+          <button type="submit" id="ask-btn" class="btn-primary">Ask</button>
+        </div>
+      </form>
+      <div class="examples" id="examples"></div>
+
+      <div id="loading" class="card loading" hidden>
+        <div class="spinner" aria-hidden="true"></div>
+        <span id="loading-text">Searching the documents…</span>
+      </div>
+      <div id="error" class="card error" hidden></div>
+
+      <div id="result" hidden>
+        <article class="card answer-card">
+          <div class="answer-head">
+            <span id="status-badge" class="badge"></span>
+            <span id="answer-meta" class="muted small"></span>
+          </div>
+          <div id="answer-text" class="answer-text"></div>
+          <div id="blocked-note" class="muted small" hidden></div>
+        </article>
+
+        <ol class="pipeline" id="pipeline"></ol>
+
+        <section class="section">
+          <div class="section-head">
+            <h2>Sources the model read</h2>
+            <span class="muted small">Chosen by the re-ranker, in its order. Click a citation in the answer to highlight its source.</span>
+          </div>
+          <div id="sources" class="sources"></div>
+        </section>
+
+        <details class="card candidates" id="candidates-box">
+          <summary>
+            <span>All candidates</span>
+            <span class="muted small" id="candidates-summary"></span>
+          </summary>
+          <div class="table-wrap">
+            <table id="candidates-table">
+              <thead>
+                <tr>
+                  <th>Status</th><th>Document</th><th>Location</th><th>Type</th>
+                  <th class="num" title="Vector search: cosine similarity">Similarity</th>
+                  <th class="num" title="Keyword search score">BM25</th>
+                  <th class="num" title="Best match among the chunk's generated questions">Q-sim</th>
+                  <th>Found by</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="muted small legend" id="threshold-legend"></p>
+        </details>
+      </div>
+    </section>
+
+    <!-- DOCUMENTS -->
+    <section id="tab-docs" class="tab-panel" hidden>
+      <div class="section-head">
+        <h2>Indexed documents</h2>
+        <span class="muted small">Every .pdf and .docx in <code>data/</code>. Run <code>python ingest.py</code> after adding or changing one.</span>
+      </div>
+      <div id="docs" class="docs-grid"></div>
+      <div class="section-head"><h2>Pipeline settings</h2><span class="muted small">From <code>config.py</code></span></div>
+      <dl id="settings" class="card settings"></dl>
+    </section>
+
+    <!-- EVALUATION -->
+    <section id="tab-eval" class="tab-panel" hidden>
+      <div id="eval-empty" class="card muted" hidden>
+        No benchmark results yet. Run <code>python benchmark.py</code> (about 5 minutes); this tab shows the latest full run.
+      </div>
+      <div id="eval-content" hidden>
+        <div class="section-head">
+          <h2>Latest benchmark</h2>
+          <span class="muted small" id="eval-meta"></span>
+        </div>
+        <div id="tiles" class="tiles"></div>
+        <div class="card">
+          <table id="cat-table" class="compact">
+            <thead><tr><th>Category</th><th class="num">Questions</th><th class="num">Answer retrieved</th><th class="num">Correct</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="section-head">
+          <h2>Questions</h2>
+          <div class="filters" id="eval-filters"></div>
+        </div>
+        <div id="eval-list" class="eval-list"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

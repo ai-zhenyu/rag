@@ -24,6 +24,9 @@ CHAT_REASONING_EFFORT = "low"
 DESCRIPTION_CACHE = DATA_DIR / "table_descriptions.json"
 MAX_QUESTION_CHARS = 500  # longer questions are rejected before any API call (long inputs carry injections)
 
+# Latest benchmark.py run, shown in the web app's Evaluation tab
+BENCHMARK_RESULTS = PROJECT_DIR / "benchmark_results.json"
+
 # Vector database
 CHROMA_DIR = PROJECT_DIR / "chroma_db"
 COLLECTION_NAME = "pdf_chunks"

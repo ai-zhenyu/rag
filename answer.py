@@ -118,17 +118,17 @@ def check_answer(text, chunks):
 
 
 def answer_with_details(question, chunks=None):
-    """Like answer(), but also returns the model's raw reply and why it was blocked, if it was."""
+    """Like answer(), but also returns the model's raw reply, why it was blocked (if it was) and tokens used."""
     question = clean_question(question)
     if not question:
-        return {"answer": EMPTY, "raw": None, "blocked": "empty question"}
+        return {"answer": EMPTY, "raw": None, "blocked": "empty question", "tokens": 0}
     if len(question) > config.MAX_QUESTION_CHARS:
-        return {"answer": TOO_LONG, "raw": None, "blocked": "question too long"}
+        return {"answer": TOO_LONG, "raw": None, "blocked": "question too long", "tokens": 0}
 
     if chunks is None:
         chunks = retrieve(question)
     if not chunks:
-        return {"answer": NOT_FOUND, "raw": None, "blocked": None}
+        return {"answer": NOT_FOUND, "raw": None, "blocked": None, "tokens": 0}
 
     response = _openai.chat.completions.create(
         model=config.CHAT_MODEL,
@@ -142,7 +142,8 @@ def answer_with_details(question, chunks=None):
     # Newer models write typographic apostrophes ("doesn’t"), which would stop the reply matching NOT_FOUND
     raw = response.choices[0].message.content.strip().replace("’", "'")
     problem = check_answer(raw, chunks)
-    return {"answer": NOT_FOUND if problem else raw, "raw": raw, "blocked": problem}
+    return {"answer": NOT_FOUND if problem else raw, "raw": raw, "blocked": problem,
+            "tokens": response.usage.total_tokens}
 
 
 def answer(question, chunks=None):

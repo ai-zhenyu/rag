@@ -28,7 +28,7 @@ from openai import OpenAI, RateLimitError
 
 import config
 from answer import EMPTY, NOT_FOUND, TOO_LONG, answer, build_context, citations
-from retrieval import hybrid_search, rerank, search
+from retrieval import format_source, hybrid_search, rerank, search
 
 JUDGE_MODEL = "gpt-6.1-sol"  # stronger than the answering model, so it isn't grading its own work
 JUDGE_REASONING_EFFORT = "low"  # the lowest this model allows
@@ -128,6 +128,7 @@ def retrieve_and_answer(item, mode):
 
 def score(item, chunks, answer_text, verdict, rerank_tokens=0):
     result = {**item, "answer": answer_text, "n_chunks": len(chunks), "rerank_tokens": rerank_tokens,
+              "sources": [format_source(c) for c in chunks if "id" in c],  # the injected fake excerpt has no id
               "context_tokens": sum(c.get("n_tokens", 0) for c in chunks),
               "correct": bool(verdict.get("correct")), "faithful": bool(verdict.get("faithful")),
               "reason": verdict.get("reason", "")}
@@ -217,3 +218,11 @@ if __name__ == "__main__":
     for cat, rs in by_cat.items():
         recall = f"{sum(r['rank'] is not None for r in rs)}/{len(rs)}" if rs[0]["evidence"] else "  -"
         print(f"    {cat:<13} {len(rs):>2}   {recall:>6}   {sum(r['correct'] for r in rs)}/{len(rs)}")
+
+    # Saved for the web app's Evaluation tab (only full runs, so a --category run doesn't replace it)
+    if "--category" not in sys.argv:
+        config.BENCHMARK_RESULTS.write_text(json.dumps({
+            "mode": label, "answer_model": config.CHAT_MODEL, "judge_model": JUDGE_MODEL,
+            "run_at": time.strftime("%Y-%m-%d %H:%M"), "results": results,
+        }, indent=1, ensure_ascii=False), encoding="utf-8")
+        print(f"\nResults saved to {config.BENCHMARK_RESULTS.name}")

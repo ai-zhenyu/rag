@@ -37,7 +37,8 @@ With the venv active:
 | `python retrieval.py "your question" [k]` | Steps 6-7: show the top k vector-search chunks with similarity scores, then the hybrid-search chunks with similarity and BM25 scores, and whether each passes the thresholds. |
 | `python answer.py "your question"` | Step 8: answer the question from the document, citing pages. |
 | `python evaluate.py` | Step 9: run 10 test questions, printing retrieved chunks, scores, the answer and the expected answer. `python evaluate.py 1 7` runs selected questions; `--full` prints whole chunks; `--vector-only` runs version 1 (no keyword search) for comparison. |
-| `python benchmark.py` | Runs the 48 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--no-rerank` scores version 3, `--no-questions` version 2 and `--vector-only` version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
+| `python benchmark.py` | Runs the 48 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--no-rerank` scores version 3, `--no-questions` version 2 and `--vector-only` version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 5 minutes. A full run is saved to `benchmark_results.json`, which the web app's Evaluation tab shows. |
+| `python app.py` | Web app at http://127.0.0.1:8000 (see below). |
 | `python calibrate.py` | Measures similarity and BM25 scores for answerable vs. unanswerable questions (used to choose both thresholds), then checks the thresholds on separate validation questions. |
 
 Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `config.py`.
@@ -48,12 +49,35 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 |---|---|
 | `config.py` | All settings in one place |
 | `ingest.py` | Extraction, table extraction, chunking, table descriptions, generated questions, embeddings, ChromaDB storage |
-| `retrieval.py` | `search(question, k)`: embedding search (embeds the question, queries Chroma, converts distance to similarity, applies the threshold). `keyword_search()`: BM25. `hybrid_search()`: both combined, used for answering |
+| `retrieval.py` | `search(question, k)`: embedding search (embeds the question, queries Chroma, converts distance to similarity, applies the threshold). `keyword_search()`: BM25. `question_search()`: generated questions. `hybrid_search()`: all three combined. `rerank()`: the chat model picks the useful chunks. `retrieve()`: hybrid search then re-ranking, used for answering |
 | `answer.py` | `answer(question)`: builds the prompt (system rules + tagged excerpts + tagged question), calls the chat model, and checks the answer before returning it |
 | `evaluate.py` | Evaluation over 10 questions, printed for manual review |
-| `eval_set.json` | 39 benchmark questions: answerable ones with evidence snippets and expected answers, plus unanswerable ones |
+| `eval_set.json` | 48 benchmark questions: answerable ones with evidence snippets and expected answers, unanswerable ones, and prompt-injection attempts |
 | `benchmark.py` | Automatic scoring over `eval_set.json` |
 | `calibrate.py` | Threshold calibration and validation |
+| `app.py` | Web app server (FastAPI): `/api/ask`, `/api/documents`, `/api/benchmark` |
+| `web/` | The web page: `index.html`, `style.css`, `app.js` (no build step, no external libraries) |
+
+## Web app (`python app.py`)
+
+The assignment asked for a terminal-only project; the web app was added afterwards to make the pipeline visible.
+It runs only on this computer (`127.0.0.1:8000`), and the API key stays on the server side.
+
+- **Ask:** type a question (or pick an example) and get the answer with clickable citations; clicking one highlights
+  the excerpt it came from. Below the answer:
+  - a pipeline strip: how many candidates the three searches found, how many passed a threshold, how many the
+    re-ranker chose, and the time and tokens of each step;
+  - the excerpts the answer model read, with their scores, which searches found them, and the generated question
+    that matched best;
+  - every candidate in a table, with scores that reached their threshold in green and whether it was sent, kept but
+    not chosen, or dropped; click a row for its text.
+- **Documents:** each indexed file with its pages or sections, chunks, table chunks and generated questions, and the
+  current settings from `config.py`.
+- **Evaluation:** the latest full `python benchmark.py` run: summary metrics, results by category, and every
+  question with its answer, the expected answer and the judge's reason, filterable to failures.
+
+`/api/ask` runs the same steps as `answer.answer()` one at a time so it can report each. Everything taken from the
+documents or the model is escaped before it is shown, so a document can't inject HTML into the page.
 
 ## Design decisions
 
