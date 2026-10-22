@@ -2,7 +2,7 @@
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent
-DATA_DIR = PROJECT_DIR / "data"  # every *.pdf here is ingested
+DATA_DIR = PROJECT_DIR / "data"  # every .pdf and .docx here is ingested
 EXTRACTED_DIR = DATA_DIR / "extracted"  # where `python ingest.py --dump` writes each PDF's raw text
 
 # Chunking (sizes are in tokens, counted with tiktoken)
@@ -19,6 +19,9 @@ CHAT_MODEL = "gpt-6-luna"
 # Reasoning models think in hidden tokens billed as output; "low" keeps that small.
 # These models reject temperature=0 (only the default 1 is allowed), so answers can vary slightly between runs.
 CHAT_REASONING_EFFORT = "low"
+# Table descriptions are saved here and reused on re-ingest, so rankings don't drift with each
+# regeneration. An entry is reused only for the same table text, model and prompt.
+DESCRIPTION_CACHE = DATA_DIR / "table_descriptions.json"
 MAX_QUESTION_CHARS = 500  # longer questions are rejected before any API call (long inputs carry injections)
 
 # Vector database
@@ -33,8 +36,9 @@ TOP_K = 10  # chunks returned by search() when k isn't given; k=10 found answers
 SIMILARITY_THRESHOLD = 0.50
 
 # Hybrid search (version 2): the top chunks from vector search and from BM25 keyword search are combined.
-HYBRID_VECTOR_K = 5   # best chunks taken from vector search
-HYBRID_KEYWORD_K = 5  # best chunks taken from keyword search
+# 7 rather than 5: at 5, NVIDIA's income statement (rank 6 in both searches) was left out of the context.
+HYBRID_VECTOR_K = 7   # best chunks taken from vector search
+HYBRID_KEYWORD_K = 7  # best chunks taken from keyword search
 # A chunk is kept if its similarity reaches SIMILARITY_THRESHOLD or its BM25 score reaches this.
 # Chosen with calibrate.py: at 7 every calibration answer chunk is kept (the weakest scored 7.6) and
 # no unanswerable question gets through that vector search didn't already let through (off-topic

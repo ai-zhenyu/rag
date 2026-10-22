@@ -6,6 +6,8 @@ PDF chunks are located by page; Word chunks by section (Word files have no fixed
 Run:  python ingest.py
       python ingest.py --dump   # also save each document's extracted text to data/extracted/<name>.txt
 """
+import hashlib
+import json
 import re
 import sys
 from collections import defaultdict
@@ -202,21 +204,40 @@ def describe_tables(chunks):
     it. A description naming the statement, periods and every row label (but no numbers)
     gives the embedding clear words to match. It is only used for the embedding; the
     answering LLM reads the raw table, so an error in a description can't reach an answer.
+
+    Descriptions are cached in config.DESCRIPTION_CACHE: regenerating them gives slightly different
+    wording each time, which moved the income statement from rank 4 to rank 6 between two ingests.
     """
     load_dotenv()
     client = OpenAI()
     tables = [c for c in chunks if c["type"] == "table"]
+    cache = _load_description_cache()
+    def key(chunk):
+        return hashlib.sha256(f"{config.CHAT_MODEL}\n{TABLE_DESCRIPTION_PROMPT}\n{chunk['text']}".encode()).hexdigest()
 
     def describe(chunk):
         response = client.chat.completions.create(
             model=config.CHAT_MODEL, reasoning_effort=config.CHAT_REASONING_EFFORT,
             messages=[{"role": "user", "content": TABLE_DESCRIPTION_PROMPT.format(table=chunk["text"])}],
         )
-        chunk["description"] = response.choices[0].message.content.strip()
+        cache[key(chunk)] = response.choices[0].message.content.strip()
 
+    missing = [c for c in tables if key(c) not in cache]
+    print(f"  {len(tables) - len(missing)} table descriptions reused from cache, {len(missing)} new")
     with ThreadPoolExecutor(max_workers=8) as pool:  # 8 requests at a time instead of one by one
-        list(pool.map(describe, tables))
+        list(pool.map(describe, missing))
+    for c in tables:
+        c["description"] = cache[key(c)]
+    if missing:
+        config.DESCRIPTION_CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
     return chunks
+
+
+def _load_description_cache():
+    try:
+        return json.loads(config.DESCRIPTION_CACHE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
 
 
 def embedding_input(chunk):

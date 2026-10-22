@@ -6,8 +6,8 @@ Built and evaluated on NVIDIA's Form 10-Q for the quarter ended July 28, 2024 (`
 ```
 PDF ──► extract (unstructured + pdfplumber) ──► chunk (tiktoken) ──► embed (OpenAI) ──► ChromaDB
                                                                                           │
-question ──┬─► vector search (top 5) ──┐
-           └─► keyword search (top 5) ─┴─► thresholds ──► gpt-6-luna ──► answer + pages
+question ──┬─► vector search (top 7) ──┐
+           └─► keyword search (top 7) ─┴─► thresholds ──► gpt-6-luna ──► answer + pages
 ```
 
 ## Setup (Windows)
@@ -35,7 +35,7 @@ With the venv active:
 | `python retrieval.py "your question" [k]` | Steps 6-7: show the top k vector-search chunks with similarity scores, then the hybrid-search chunks with similarity and BM25 scores, and whether each passes the thresholds. |
 | `python answer.py "your question"` | Step 8: answer the question from the document, citing pages. |
 | `python evaluate.py` | Step 9: run 10 test questions, printing retrieved chunks, scores, the answer and the expected answer. `python evaluate.py 1 7` runs selected questions; `--full` prints whole chunks; `--vector-only` runs version 1 (no keyword search) for comparison. |
-| `python benchmark.py` | Runs the 39 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--vector-only` scores version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
+| `python benchmark.py` | Runs the 48 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--vector-only` scores version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
 | `python calibrate.py` | Measures similarity and BM25 scores for answerable vs. unanswerable questions (used to choose both thresholds), then checks the thresholds on separate validation questions. |
 
 Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `config.py`.
@@ -57,11 +57,11 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 
 - **Text extraction:** `unstructured` with `strategy="fast"` (no OCR or system dependencies). It reads tables column by column, separating labels from their numbers, so tables are extracted separately with **pdfplumber** (pure Python) as one row per line, e.g. `Revenue | 30,040 | 13,507 | 56,084 | 20,699`, with their title and column headers. The scrambled copy of each table is removed from the `unstructured` text by position.
 - **Chunking:** whole paragraphs are packed into chunks of 300-500 tokens (`cl100k_base`); a paragraph is never cut. Chunks may cross a page break and store `page_start`/`page_end`. Tables are separate chunks; tables over 500 tokens are split by rows with the header repeated. Result: 180 chunks (131 prose, 49 table); 125 of 131 prose chunks are in 300-500 tokens.
-- **Table descriptions:** number-heavy tables embed poorly (the income statement ranked #41 of 180 for a revenue question). During ingest, the chat model (`gpt-6-luna`; the current index was built with `gpt-4o-mini`) writes a number-free description of each table (topic, periods, every row label). The *embedding* uses description + table; the stored *text* is the raw table, so answers only read real figures.
+- **Table descriptions:** number-heavy tables embed poorly (the income statement ranked #41 of 180 for a revenue question). During ingest, the chat model (`gpt-6-luna`) writes a number-free description of each table (topic, periods, every row label). Descriptions are cached in `data/table_descriptions.json` (keyed by table text, model and prompt) and reused on re-ingest: regenerating them changes the wording slightly and moved the income statement from rank 4 to 6. The *embedding* uses description + table; the stored *text* is the raw table, so answers only read real figures.
 - **Storage:** ChromaDB persistent collection with `space="cosine"`. Chroma fields: `documents` = chunk text, `embeddings` = OpenAI vectors (`text-embedding-3-small`, 1,536 dimensions), `metadatas` = `n_tokens`, `page_start`, `page_end`, `type`, `source` (+ `description` for tables).
 - **Distance to similarity:** for a cosine collection Chroma returns `distance = 1 - cosine_similarity`, so `similarity = 1 - distance`.
 - **Threshold = 0.50, TOP_K = 10**, chosen with `calibrate.py` rather than the suggested 0.6: chunks containing the answer scored 0.49-0.72, off-topic and other-company questions at most 0.44. At 0.6 the correct R&D chunk (0.595) would be dropped. On-topic questions the document can't answer (e.g. revenue in fiscal 2027, 0.68) score as high as real answers; no threshold separates them, so the answer prompt handles those.
-- **Hybrid search (version 2):** vector search misses exact terms buried in a chunk about other topics and small tables (the inventory table ranked #44). BM25 keyword search (`rank_bm25`) ranks chunks by shared words, weighting rare words like "Blackwell" more. `hybrid_search()` takes the top 5 from each and merges duplicates. Standard Reciprocal Rank Fusion was tested but left the inventory table at #13, outside the context. A chunk is kept if its similarity is >= 0.50 **or** its BM25 score is >= 7. That keyword threshold was chosen with `calibrate.py`: at 7 all 14 calibration answers are kept and no unanswerable question gets through that vector search didn't already let through. The margin is thin (off-topic noise reached 6.7, the weakest answer 7.6).
+- **Hybrid search (version 2):** vector search misses exact terms buried in a chunk about other topics and small tables (the inventory table ranked #44). BM25 keyword search (`rank_bm25`) ranks chunks by shared words, weighting rare words like "Blackwell" more. `hybrid_search()` takes the top 7 from each and merges duplicates (5 at first; raised to 7 when NVIDIA's income statement slipped to rank 6 in both searches and fell out of the context). Standard Reciprocal Rank Fusion was tested but left the inventory table at #13, outside the context. A chunk is kept if its similarity is >= 0.50 **or** its BM25 score is >= 7. That keyword threshold was chosen with `calibrate.py`: at 7 all 14 calibration answers are kept and no unanswerable question gets through that vector search didn't already let through. The margin is thin (off-topic noise reached 6.7, the weakest answer 7.6).
 - **Answering:** `gpt-6-luna` with `reasoning_effort="low"` (it rejects `temperature=0`, so wording can vary slightly between runs), instructed to use only the excerpts, cite pages, and otherwise reply with a fixed "not in the document" message. If no chunk passes the threshold the model is not called. Excerpts are labelled only with their page (`=== Excerpt from p. 3 (table) ===`); with numbered labels like `[Source 4 | p. 3]` the model cited the wrong page.
 
 ## Multiple PDFs
@@ -137,16 +137,31 @@ Limitations: no prompt defence is complete. The output check can't catch injecte
 
 ## Benchmark (`python benchmark.py`)
 
-39 questions in `eval_set.json`: 29 answerable (8 using the document's wording, 16 deliberately paraphrased, 5 "why"/comparison) and 10 unanswerable (off-topic, other companies, and on-topic facts the filing doesn't contain, including a trap: it mentions expected Q4 Blackwell revenue but no total Q4 revenue).
+48 questions in `eval_set.json` (39 at first; 9 adversarial added later): 29 answerable (8 using the document's wording, 16 deliberately paraphrased, 5 "why"/comparison) and 10 unanswerable (off-topic, other companies, and on-topic facts the filing doesn't contain, including a trap: it mentions expected Q4 Blackwell revenue but no total Q4 revenue).
 
-| Metric | v1 vector | v2 hybrid |
-|---|---|---|
-| Recall (answer chunk sent to the LLM) | 21/29 (72%) | **24/29 (83%)** |
-| MRR | 0.55 | **0.60** |
-| Correct | 22/29 (76%) | **23/29 (79%)** |
-| Citation includes a right page | 20/29 (69%) | 21/29 (72%) |
-| Unanswerable correctly declined | 10/10 | 10/10 |
-| Faithful (no unsupported claims) | 39/39 | 39/39 |
+| Metric | v1 vector | v2 hybrid | v2, new models |
+|---|---|---|---|
+| Recall (answer chunk sent to the LLM) | 21/29 (72%) | **24/29 (83%)** | 24/29 (83%) |
+| MRR | 0.55 | 0.60 | **0.61** |
+| Correct | 22/29 (76%) | **23/29 (79%)** | 21/29 (72%) |
+| Citation includes a right page | 20/29 (69%) | **21/29 (72%)** | 19/29 (66%) |
+| Unanswerable correctly declined | 10/10 | 10/10 | 9/10 |
+| Adversarial handled safely | - | - | 9/9 |
+| Faithful (no unsupported claims) | 39/39 | 39/39 | 48/48 |
+
+The first two columns used `gpt-4o-mini` to answer and `gpt-4o` to judge, with 5 + 5 candidates. "v2, new models" uses
+`gpt-6-luna` / `gpt-6.1-sol`, 7 + 7 candidates, table descriptions rewritten by `gpt-6-luna`, and AMD's 10-Q and a
+homework PDF ingested alongside NVIDIA's.
+
+What changed with the new models:
+- **The new judge is stricter.** 3 of the 8 failures (#7, #23, #28) state the main fact correctly but omit a secondary
+  detail of the reference answer (e.g. "+154% year over year"); `gpt-4o` passed answers like these.
+- **#34 ("AMD's data center revenue") is now a stale test:** AMD's 10-Q is ingested, so answering it from `amd-1.pdf`
+  is right. Excluding it, unanswerable questions are 9/9.
+- **#20 is fixed:** `gpt-6-luna` connects "largest direct customer" with "Customer A".
+- **#1 regressed:** the income statement ranks #9 in vector search for "total revenue in the second quarter of fiscal
+  2025", behind seven narrative chunks that repeat the question's wording. Ranks of table chunks shift whenever their
+  descriptions change, which is why descriptions are now cached.
 
 Findings:
 - **Hybrid search clearly improves retrieval** (recall +11 points), but end-to-end correctness only by one question, which is within run-to-run variation: borderline questions (#1, #8) flip between runs.
