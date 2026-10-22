@@ -28,7 +28,8 @@ import config
 from answer import EMPTY, NOT_FOUND, TOO_LONG, answer, build_context, citations
 from retrieval import hybrid_search, search
 
-JUDGE_MODEL = "gpt-4o"  # stronger than the answering model, so it isn't grading its own work
+JUDGE_MODEL = "gpt-6.1-sol"  # stronger than the answering model, so it isn't grading its own work
+JUDGE_REASONING_EFFORT = "low"  # the lowest this model allows
 
 JUDGE_PROMPT = """You are grading an answer produced by a question-answering system over one PDF.
 
@@ -101,7 +102,7 @@ def judge(item, answer_text, chunks):
     for attempt in range(30):
         try:
             response = _judge.chat.completions.create(
-                model=JUDGE_MODEL, temperature=0, response_format={"type": "json_object"},
+                model=JUDGE_MODEL, reasoning_effort=JUDGE_REASONING_EFFORT, response_format={"type": "json_object"},
                 messages=[{"role": "user", "content": prompt}],
             )
             return json.loads(response.choices[0].message.content)

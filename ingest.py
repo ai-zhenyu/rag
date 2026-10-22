@@ -209,7 +209,7 @@ def describe_tables(chunks):
 
     def describe(chunk):
         response = client.chat.completions.create(
-            model=config.CHAT_MODEL, temperature=0,
+            model=config.CHAT_MODEL, reasoning_effort=config.CHAT_REASONING_EFFORT,
             messages=[{"role": "user", "content": TABLE_DESCRIPTION_PROMPT.format(table=chunk["text"])}],
         )
         chunk["description"] = response.choices[0].message.content.strip()

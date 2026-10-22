@@ -137,14 +137,15 @@ def answer_with_details(question, chunks=None):
 
     response = _openai.chat.completions.create(
         model=config.CHAT_MODEL,
-        temperature=0,  # most likely wording every time: consistent answers for evaluation
+        reasoning_effort=config.CHAT_REASONING_EFFORT,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"<excerpts>\n{build_context(chunks)}\n</excerpts>\n\n"
                                         f"<question>\n{_escape(question)}\n</question>"},
         ],
     )
-    raw = response.choices[0].message.content.strip()
+    # Newer models write typographic apostrophes ("doesn’t"), which would stop the reply matching NOT_FOUND
+    raw = response.choices[0].message.content.strip().replace("’", "'")
     problem = check_answer(raw, chunks)
     return {"answer": NOT_FOUND if problem else raw, "raw": raw, "blocked": problem}
 

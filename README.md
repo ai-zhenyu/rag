@@ -7,7 +7,7 @@ Built and evaluated on NVIDIA's Form 10-Q for the quarter ended July 28, 2024 (`
 PDF ──► extract (unstructured + pdfplumber) ──► chunk (tiktoken) ──► embed (OpenAI) ──► ChromaDB
                                                                                           │
 question ──┬─► vector search (top 5) ──┐
-           └─► keyword search (top 5) ─┴─► thresholds ──► gpt-4o-mini ──► answer + pages
+           └─► keyword search (top 5) ─┴─► thresholds ──► gpt-6-luna ──► answer + pages
 ```
 
 ## Setup (Windows)
@@ -35,7 +35,7 @@ With the venv active:
 | `python retrieval.py "your question" [k]` | Steps 6-7: show the top k vector-search chunks with similarity scores, then the hybrid-search chunks with similarity and BM25 scores, and whether each passes the thresholds. |
 | `python answer.py "your question"` | Step 8: answer the question from the document, citing pages. |
 | `python evaluate.py` | Step 9: run 10 test questions, printing retrieved chunks, scores, the answer and the expected answer. `python evaluate.py 1 7` runs selected questions; `--full` prints whole chunks; `--vector-only` runs version 1 (no keyword search) for comparison. |
-| `python benchmark.py` | Runs the 39 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-4o`), and citation accuracy. `--vector-only` scores version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
+| `python benchmark.py` | Runs the 39 questions in `eval_set.json` and scores them automatically: retrieval recall and MRR, answer correctness and faithfulness (judged by `gpt-6.1-sol`), and citation accuracy. `--vector-only` scores version 1. Needs `python ingest.py --dump` first (accepted citation pages are found in the dump). Takes about 3 minutes. |
 | `python calibrate.py` | Measures similarity and BM25 scores for answerable vs. unanswerable questions (used to choose both thresholds), then checks the thresholds on separate validation questions. |
 
 Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `config.py`.
@@ -57,12 +57,12 @@ Settings (models, chunk sizes, `TOP_K`, thresholds, hybrid sizes) live in `confi
 
 - **Text extraction:** `unstructured` with `strategy="fast"` (no OCR or system dependencies). It reads tables column by column, separating labels from their numbers, so tables are extracted separately with **pdfplumber** (pure Python) as one row per line, e.g. `Revenue | 30,040 | 13,507 | 56,084 | 20,699`, with their title and column headers. The scrambled copy of each table is removed from the `unstructured` text by position.
 - **Chunking:** whole paragraphs are packed into chunks of 300-500 tokens (`cl100k_base`); a paragraph is never cut. Chunks may cross a page break and store `page_start`/`page_end`. Tables are separate chunks; tables over 500 tokens are split by rows with the header repeated. Result: 180 chunks (131 prose, 49 table); 125 of 131 prose chunks are in 300-500 tokens.
-- **Table descriptions:** number-heavy tables embed poorly (the income statement ranked #41 of 180 for a revenue question). During ingest, `gpt-4o-mini` writes a number-free description of each table (topic, periods, every row label). The *embedding* uses description + table; the stored *text* is the raw table, so answers only read real figures.
+- **Table descriptions:** number-heavy tables embed poorly (the income statement ranked #41 of 180 for a revenue question). During ingest, the chat model (`gpt-6-luna`; the current index was built with `gpt-4o-mini`) writes a number-free description of each table (topic, periods, every row label). The *embedding* uses description + table; the stored *text* is the raw table, so answers only read real figures.
 - **Storage:** ChromaDB persistent collection with `space="cosine"`. Chroma fields: `documents` = chunk text, `embeddings` = OpenAI vectors (`text-embedding-3-small`, 1,536 dimensions), `metadatas` = `n_tokens`, `page_start`, `page_end`, `type`, `source` (+ `description` for tables).
 - **Distance to similarity:** for a cosine collection Chroma returns `distance = 1 - cosine_similarity`, so `similarity = 1 - distance`.
 - **Threshold = 0.50, TOP_K = 10**, chosen with `calibrate.py` rather than the suggested 0.6: chunks containing the answer scored 0.49-0.72, off-topic and other-company questions at most 0.44. At 0.6 the correct R&D chunk (0.595) would be dropped. On-topic questions the document can't answer (e.g. revenue in fiscal 2027, 0.68) score as high as real answers; no threshold separates them, so the answer prompt handles those.
 - **Hybrid search (version 2):** vector search misses exact terms buried in a chunk about other topics and small tables (the inventory table ranked #44). BM25 keyword search (`rank_bm25`) ranks chunks by shared words, weighting rare words like "Blackwell" more. `hybrid_search()` takes the top 5 from each and merges duplicates. Standard Reciprocal Rank Fusion was tested but left the inventory table at #13, outside the context. A chunk is kept if its similarity is >= 0.50 **or** its BM25 score is >= 7. That keyword threshold was chosen with `calibrate.py`: at 7 all 14 calibration answers are kept and no unanswerable question gets through that vector search didn't already let through. The margin is thin (off-topic noise reached 6.7, the weakest answer 7.6).
-- **Answering:** `gpt-4o-mini`, `temperature=0`, instructed to use only the excerpts, cite pages, and otherwise reply with a fixed "not in the document" message. If no chunk passes the threshold the model is not called. Excerpts are labelled only with their page (`=== Excerpt from p. 3 (table) ===`); with numbered labels like `[Source 4 | p. 3]` the model cited the wrong page.
+- **Answering:** `gpt-6-luna` with `reasoning_effort="low"` (it rejects `temperature=0`, so wording can vary slightly between runs), instructed to use only the excerpts, cite pages, and otherwise reply with a fixed "not in the document" message. If no chunk passes the threshold the model is not called. Excerpts are labelled only with their page (`=== Excerpt from p. 3 (table) ===`); with numbered labels like `[Source 4 | p. 3]` the model cited the wrong page.
 
 ## Multiple PDFs
 
@@ -75,7 +75,7 @@ Every `*.pdf` in `data/` is ingested. Each chunk records its file in the `source
 Tested with NVIDIA's and AMD's 10-Qs plus an unrelated homework PDF (the last two are not committed): questions about each file cite the right file, and comparisons cite each company's figure to its own document.
 
 Limitations:
-- **Ambiguous questions are answered inconsistently.** When a question doesn't name a company ("What was Data Center revenue last quarter?"), the prompt asks the model to answer for every document that has the answer. `gpt-4o-mini` does this only sometimes: gross margin was answered for both companies, Data Center revenue only for AMD, although NVIDIA's figure was in the context. Rewording the rule more strongly made it worse. A structural fix would be to answer each document separately and then combine the answers (more LLM calls). Until then, name the company in the question.
+- **Ambiguous questions are answered inconsistently.** When a question doesn't name a company ("What was Data Center revenue last quarter?"), the prompt asks the model to answer for every document that has the answer. `gpt-4o-mini` (the answer model at the time) did this only sometimes: gross margin was answered for both companies, Data Center revenue only for AMD, although NVIDIA's figure was in the context. Rewording the rule more strongly made it worse. A structural fix would be to answer each document separately and then combine the answers (more LLM calls). Until then, name the company in the question.
 - **More context per question.** Every document contributes its passing chunks, so with two 10-Qs a financial question sends ~7-8K input tokens instead of ~3K (about $0.0012 instead of $0.0005 per question), including chunks from the company not asked about.
 - **Unanswerable test questions depend on the document set.** Adding AMD's 10-Q made "Who is the CEO of AMD?" answerable (Dr. Lisa Su, amd-1.pdf, p. 56), so that adversarial test had to change. Re-check `eval_set.json` when documents are added.
 - **Scanned PDFs and broken fonts are skipped, not read.** Reading them needs OCR.
@@ -158,6 +158,6 @@ Findings:
 Lessons from building the benchmark itself:
 - Hand-written citation pages were wrong (the $50.0 billion buyback approval appears on pp. 20, 32 and 40), so accepted pages are now found automatically in the extracted text.
 - The LLM judge marked "not found" as correct for answerable questions and once cited facts that weren't in the excerpts. Refusals are now graded by rule, and the judge is told to use only the excerpts.
-- The judge isn't fully consistent even at temperature 0: the same safe answer to adversarial #42 was graded FAIL in one run and ok in the next. Don't over-read single-question differences between runs.
+- The judge isn't fully consistent (this was `gpt-4o` at temperature 0; `gpt-6.1-sol` can't use temperature 0 at all): the same safe answer to adversarial #42 was graded FAIL in one run and ok in the next. Don't over-read single-question differences between runs.
 
 Next improvements: query rewriting (expanding paraphrases into the document's vocabulary), a re-ranking step, and citing the exact page of cross-page chunks.

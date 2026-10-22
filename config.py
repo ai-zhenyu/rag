@@ -15,7 +15,10 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_BATCH_SIZE = 100  # chunks sent per API request
 
 # Chat model: writes table descriptions during ingest, and answers questions in answer.py
-CHAT_MODEL = "gpt-4o-mini"
+CHAT_MODEL = "gpt-6-luna"
+# Reasoning models think in hidden tokens billed as output; "low" keeps that small.
+# These models reject temperature=0 (only the default 1 is allowed), so answers can vary slightly between runs.
+CHAT_REASONING_EFFORT = "low"
 MAX_QUESTION_CHARS = 500  # longer questions are rejected before any API call (long inputs carry injections)
 
 # Vector database
